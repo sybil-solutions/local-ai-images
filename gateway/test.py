@@ -9,6 +9,7 @@ user message asks for one. Each test asserts the exact shapes Claude Code
 
 import json
 import os
+import select
 import socket
 import subprocess
 import sys
@@ -23,6 +24,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE_PORT, GATEWAY_PORT = 18000, 18434
 KEY = "test-key-123"
 DEADLINE, SLOTS = 1.0, 4
+# A second engine+gateway pair for the cancel-on-disconnect tests: the engine answers slowly and
+# records when its client (the gateway) closes, so we can see the gateway cut it off.
+SLOW_ENGINE_PORT, SLOW_GATEWAY_PORT = 18001, 18435
+GATEWAY_FILE = os.environ.get("GATEWAY_FILE", os.path.join(HERE, "gateway.py"))
 
 
 class FakeEngine(BaseHTTPRequestHandler):
@@ -92,6 +97,121 @@ class FakeEngine(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class SlowEngine(BaseHTTPRequestHandler):
+    """A deliberately slow engine that records when its client (the gateway) closes the connection.
+
+    Non-streamed: it holds the response headers for ANSWER_DELAY seconds (a long decode), peeking its
+    own socket for EOF the whole time. Streamed: it sends the first chunk after one STEP, then a chunk
+    every STEP, peeking between them. The moment the gateway shuts the upstream connection, the peek
+    returns empty and the time is recorded in `seen`, which is how a cancel-on-disconnect shows up.
+    """
+    protocol_version = "HTTP/1.1"
+    ANSWER_DELAY = 2.5          # a non-streamed answer is withheld this long
+    STEP = 0.4                  # gap between streamed chunks
+    WORDS = ("Hello ", "from ", "the ", "engine")
+    lock = threading.Lock()
+    seen = []                   # one record per request: {"path", "stream", "start", "disconnect", "completed"}
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        body = json.dumps({"object": "list", "data": [{"id": "fake-model", "object": "model"}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def client_gone(self):
+        try:
+            ready, _, _ = select.select([self.connection], [], [], 0)
+        except OSError:
+            return True
+        if not ready:
+            return False
+        try:
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
+
+    def wait(self, record, seconds):
+        """Sleep up to `seconds`, returning True if the client disconnected first (recording when)."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.client_gone():
+                with SlowEngine.lock:
+                    record["disconnect"] = time.monotonic() - record["start"]
+                return True
+            time.sleep(0.05)
+        return False
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        req = json.loads(self.rfile.read(length) or b"{}")
+        record = {"path": self.path, "stream": bool(req.get("stream")), "start": time.monotonic(), "disconnect": None, "completed": False}
+        with SlowEngine.lock:
+            SlowEngine.seen.append(record)
+        base = {"id": "chatcmpl-1", "object": "chat.completion.chunk", "model": req.get("model", "fake-model")}
+        try:
+            if req.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for word in self.WORDS:
+                    if self.wait(record, self.STEP):
+                        return
+                    self.wfile.write(f"data: {json.dumps(dict(base, choices=[{'index': 0, 'delta': {'content': word}, 'finish_reason': None}]))}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write(f"data: {json.dumps(dict(base, choices=[{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]))}\n\n".encode())
+                self.wfile.write(f"data: {json.dumps(dict(base, choices=[], usage={'prompt_tokens': 10, 'completion_tokens': 4, 'total_tokens': 14}))}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                self.close_connection = True
+            else:
+                if self.wait(record, self.ANSWER_DELAY):  # withhold the whole answer, like a long non-streamed decode
+                    return
+                body = json.dumps({"id": "chatcmpl-1", "object": "chat.completion", "model": req.get("model", "fake-model"),
+                                   "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello from the engine"}, "finish_reason": "stop"}],
+                                   "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            with SlowEngine.lock:
+                record["completed"] = True
+        except OSError:  # the gateway shut the connection mid-answer
+            if record["disconnect"] is None:
+                with SlowEngine.lock:
+                    record["disconnect"] = time.monotonic() - record["start"]
+
+
+def raw_post(port, path, body, disconnect_after=None):
+    """Send one POST over a raw socket. If disconnect_after is set, close the socket then; else read the full reply."""
+    data = json.dumps(body).encode()
+    head = (f"POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {KEY}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(data)}\r\nConnection: close\r\n\r\n").encode()
+    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    sock.sendall(head + data)
+    if disconnect_after is not None:
+        time.sleep(disconnect_after)
+        sock.close()
+        return None
+    sock.settimeout(10)
+    chunks = []
+    while True:
+        try:
+            piece = sock.recv(65536)
+        except socket.timeout:
+            break
+        if not piece:
+            break
+        chunks.append(piece)
+    sock.close()
+    return b"".join(chunks)
+
+
 def call(path, body=None, key=KEY, stream=False):
     req = urllib.request.Request(f"http://127.0.0.1:{GATEWAY_PORT}{path}", data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Content-Type": "application/json", **({"Authorization": f"Bearer {key}"} if key else {})}, method="POST" if body is not None else "GET")
@@ -122,6 +242,56 @@ def check(name, condition, detail=""):
         sys.exit(1)
 
 
+def disconnect_tests(key_file):
+    """A client that drops mid-answer must make the gateway cut the engine off on every proxied path."""
+    engine = ThreadingHTTPServer(("127.0.0.1", SLOW_ENGINE_PORT), SlowEngine)
+    threading.Thread(target=engine.serve_forever, daemon=True).start()
+    env = dict(os.environ, UPSTREAM=f"http://127.0.0.1:{SLOW_ENGINE_PORT}", GATEWAY_PORT=str(SLOW_GATEWAY_PORT),
+               GATEWAY_KEY_FILE=key_file, MODEL="fake-model")
+    gateway = subprocess.Popen([sys.executable, GATEWAY_FILE], env=env, stderr=subprocess.PIPE)
+    # These paths each reach the engine through a different gateway code path (chat passthrough,
+    # /v1/completions passthrough, Anthropic Messages, OpenAI Responses), streamed and not.
+    cases = [
+        ("chat non-stream", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+        ("chat stream", "/v1/chat/completions", {"model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]}),
+        ("completions non-stream", "/v1/completions", {"model": "m", "prompt": "hi"}),
+        ("messages non-stream", "/v1/messages", {"model": "m", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}),
+        ("messages stream", "/v1/messages", {"model": "m", "max_tokens": 64, "stream": True, "messages": [{"role": "user", "content": "hi"}]}),
+        ("responses non-stream", "/v1/responses", {"model": "m", "input": "hi"}),
+        ("responses stream", "/v1/responses", {"model": "m", "stream": True, "input": "hi"}),
+    ]
+    try:
+        for _ in range(50):
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{SLOW_GATEWAY_PORT}/health", timeout=1); break
+            except Exception:
+                time.sleep(0.1)
+        for label, path, body in cases:
+            # A client that disconnects after ~1s: the engine must observe its connection closed within ~2s.
+            before = len(SlowEngine.seen)
+            raw_post(SLOW_GATEWAY_PORT, path, body, disconnect_after=1.0)
+            record = None
+            for _ in range(40):  # wait up to 2s past the disconnect for the engine to notice
+                with SlowEngine.lock:
+                    record = SlowEngine.seen[before] if len(SlowEngine.seen) > before else None
+                    noticed = record is not None and record["disconnect"] is not None
+                if noticed:
+                    break
+                time.sleep(0.05)
+            check(f"disconnect cancels the engine: {label}",
+                  record is not None and record["disconnect"] is not None and record["disconnect"] < 3.0 and not record["completed"],
+                  str(record))
+            # A client that stays connected still gets the full answer on the same path. A streamed answer
+            # arrives split across SSE deltas, so assert every word is present rather than one contiguous string.
+            reply = raw_post(SLOW_GATEWAY_PORT, path, body)
+            check(f"a connected client still gets the full answer: {label}",
+                  reply is not None and all(word.strip().encode() in reply for word in SlowEngine.WORDS),
+                  (reply or b"")[-200:].decode(errors="replace"))
+    finally:
+        gateway.terminate()
+        engine.shutdown()
+
+
 def main():
     engine = ThreadingHTTPServer(("127.0.0.1", ENGINE_PORT), FakeEngine)
     threading.Thread(target=engine.serve_forever, daemon=True).start()
@@ -130,7 +300,7 @@ def main():
     usage_log = os.path.join(tempfile.mkdtemp(), "usage.jsonl")
     env = dict(os.environ, UPSTREAM=f"http://127.0.0.1:{ENGINE_PORT}", GATEWAY_PORT=str(GATEWAY_PORT), GATEWAY_KEY_FILE=key_file.name, MODEL="fake-model",
                GATEWAY_USAGE_LOG=usage_log, GATEWAY_REQUEST_DEADLINE=str(DEADLINE), GATEWAY_MAX_CONNECTIONS=str(SLOTS))
-    gateway = subprocess.Popen([sys.executable, os.path.join(HERE, "gateway.py")], env=env, stderr=subprocess.PIPE)
+    gateway = subprocess.Popen([sys.executable, GATEWAY_FILE], env=env, stderr=subprocess.PIPE)
     try:
         for _ in range(50):
             try:
@@ -297,6 +467,8 @@ def main():
         check("pipelined health requests with unread answers do not hold the slots", status == 200, str(status))
         for sock in piped:
             sock.close()
+        # cancel-on-disconnect: every proxied path, streamed and not, against a slow engine
+        disconnect_tests(key_file.name)
         print(f"# {passed} passed")
     finally:
         gateway.terminate()

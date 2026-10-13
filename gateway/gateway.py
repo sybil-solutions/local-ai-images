@@ -29,12 +29,22 @@ write to a client must finish within GATEWAY_WRITE_DEADLINE seconds (default
 pipelined requests are never answered. So a client without the key holds a
 thread no longer than one request's deadline, however it sends or reads.
 
+Cancellation: while the gateway waits on the engine (for the response headers,
+a non-streamed body, or the next streamed chunk) a watcher thread peeks the
+client socket. If the client has disconnected (EOF) the upstream connection is
+shut at once, so the engine aborts the generation instead of running on behind
+a gone client. The watcher only ever MSG_PEEKs, so it consumes no request byte
+and leaves a quiet keep-alive client untouched; an HTTP/1.1 client does not
+half-close a request socket while still reading its answer, so a readable
+socket that peeks empty means the client is gone, not merely done sending.
+
 Standard library only. No configuration beyond the environment above.
 """
 
 import http.client
 import json
 import os
+import select
 import socket
 import sys
 import threading
@@ -110,9 +120,28 @@ class Upstream:
         self.conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=TIMEOUT)
         headers = {"Content-Type": "application/json", "Accept": "*/*"}
         data = json.dumps(body).encode() if body is not None else None
-        self.conn.request(method, path, body=data, headers=headers)
+        self.conn.request(method, path, body=data, headers=headers)  # request is sent; the answer is read by begin()
+        self.response = None
+        self.status = None
+
+    def begin(self):
+        """Block until the engine answers the headers (the whole answer when not streamed) and return self."""
         self.response = self.conn.getresponse()
         self.status = self.response.status
+        return self
+
+    def abort(self):
+        """Shut the connection to the engine from another thread; a read blocked here wakes with an error."""
+        sock = self.conn.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        try:
+            self.conn.close()
+        except OSError:
+            pass
 
     def json(self):
         raw = self.response.read()
@@ -146,6 +175,57 @@ class Upstream:
                         continue
         finally:
             self.conn.close()
+
+
+class CancelGuard:
+    """Watch a client socket while the gateway waits on the engine; on client EOF, abort the upstream.
+
+    Used as a context manager around every blocking wait on the engine (the response headers, a
+    non-streamed body read, each streamed chunk). A daemon thread selects the client socket and
+    MSG_PEEKs one byte: an empty peek is EOF, so the client is gone and the upstream connection is
+    shut at once, which makes the engine abort the request. The peek never consumes a byte, so a
+    quiet keep-alive client and any bytes a client pipelined are left in place. HTTP/1.1 clients do
+    not half-close a request socket while still reading the answer, so a readable-but-empty peek is
+    taken for a real disconnect rather than a client that merely finished sending.
+    """
+
+    POLL = 0.25  # seconds between peeks; also the ceiling on how long after a disconnect the abort fires
+
+    def __init__(self, client_sock, upstream):
+        self.client_sock = client_sock
+        self.upstream = upstream
+        self.stop = threading.Event()
+        self.fired = False
+        self.thread = threading.Thread(target=self._watch, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        return False
+
+    def _watch(self):
+        sock = self.client_sock
+        while not self.stop.is_set():
+            try:
+                ready, _, _ = select.select([sock], [], [], self.POLL)
+            except (OSError, ValueError):
+                return  # the socket was closed under us; nothing to watch
+            if not ready or self.stop.is_set():
+                continue
+            try:
+                peek = sock.recv(1, socket.MSG_PEEK)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                peek = b""  # a reset or other read error: treat the client as gone
+            if peek == b"":
+                self.fired = True
+                self.upstream.abort()
+                return
+            self.stop.wait(self.POLL)  # a pipelining client; never consume its bytes, just keep watching
 
 
 def upstream_model(requested):
@@ -571,6 +651,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True  # no key: one answer, then the connection is closed
             try:
                 up = Upstream("GET", "/v1/models")
+                up.begin()
                 up.raw()
                 self.send_json(200 if up.status == 200 else 503, {"status": "ok" if up.status == 200 else "engine unavailable"})
             except Exception as error:
@@ -623,93 +704,97 @@ class Handler(BaseHTTPRequestHandler):
 
     def passthrough(self, method, path, body, hide_usage=False):
         meter = Meter("chat", (body or {}).get("model") or MODEL_ALIAS) if path.endswith("/chat/completions") else None
-        up = Upstream(method, path, body)  # returns once the engine has answered the headers: after the whole answer when not streamed
-        if body and body.get("stream") and up.status == 200:
-            self.start_sse()
-            try:
-                # forward the engine's SSE line by line, metering the deltas as they pass; the usage-only
-                # chunk this gateway asked for is dropped when the client did not ask for it
-                pending = b""
-                while True:
-                    chunk = up.response.read1(65536) if hasattr(up.response, "read1") else up.response.read(65536)
-                    if not chunk:
-                        break
-                    pending += chunk
-                    out = b""
-                    while b"\n" in pending:
-                        raw_line, pending = pending.split(b"\n", 1)
-                        line = raw_line.strip()
-                        if line.startswith(b"data:") and line[5:].strip() != b"[DONE]":
-                            try:
-                                obj = json.loads(line[5:])
-                            except json.JSONDecodeError:
-                                obj = None
-                            if isinstance(obj, dict):
-                                if meter:
-                                    meter.chunk(obj)
-                                if hide_usage and obj.get("usage") and not obj.get("choices"):
-                                    continue
-                        out += raw_line + b"\n"
-                    if out:
-                        self.wfile.write(out)
+        up = Upstream(method, path, body)
+        with CancelGuard(self.connection, up):  # abort the engine if the client disconnects while we wait on it
+            up.begin()  # returns once the engine has answered the headers: after the whole answer when not streamed
+            if body and body.get("stream") and up.status == 200:
+                self.start_sse()
+                try:
+                    # forward the engine's SSE line by line, metering the deltas as they pass; the usage-only
+                    # chunk this gateway asked for is dropped when the client did not ask for it
+                    pending = b""
+                    while True:
+                        chunk = up.response.read1(65536) if hasattr(up.response, "read1") else up.response.read(65536)
+                        if not chunk:
+                            break
+                        pending += chunk
+                        out = b""
+                        while b"\n" in pending:
+                            raw_line, pending = pending.split(b"\n", 1)
+                            line = raw_line.strip()
+                            if line.startswith(b"data:") and line[5:].strip() != b"[DONE]":
+                                try:
+                                    obj = json.loads(line[5:])
+                                except json.JSONDecodeError:
+                                    obj = None
+                                if isinstance(obj, dict):
+                                    if meter:
+                                        meter.chunk(obj)
+                                    if hide_usage and obj.get("usage") and not obj.get("choices"):
+                                        continue
+                            out += raw_line + b"\n"
+                        if out:
+                            self.wfile.write(out)
+                            self.wfile.flush()
+                    if pending:
+                        self.wfile.write(pending)
                         self.wfile.flush()
-                if pending:
-                    self.wfile.write(pending)
-                    self.wfile.flush()
-            finally:
-                up.conn.close()
-            if meter:
-                meter.done()
-            return
-        raw = up.raw()
-        if meter and up.status == 200:
-            try:
-                meter.done(json.loads(raw).get("usage"))
-            except (ValueError, AttributeError):
-                meter.done()
-        self.send_response(up.status)
-        self.send_header("Content-Type", up.response.getheader("Content-Type") or "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+                finally:
+                    up.conn.close()
+                if meter:
+                    meter.done()
+                return
+            raw = up.raw()
+            if meter and up.status == 200:
+                try:
+                    meter.done(json.loads(raw).get("usage"))
+                except (ValueError, AttributeError):
+                    meter.done()
+            self.send_response(up.status)
+            self.send_header("Content-Type", up.response.getheader("Content-Type") or "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
 
     def handle_messages(self, body):
         model = body.get("model") or MODEL_ALIAS
         chat = anthropic_to_chat(body)
         meter = Meter("messages", MODEL_ALIAS or model)
-        if chat.get("stream"):
+        streaming = bool(chat.get("stream"))
+        if streaming:
             chat["stream_options"] = {"include_usage": True}
-            up = Upstream("POST", "/v1/chat/completions", chat)
+        up = Upstream("POST", "/v1/chat/completions", chat)
+        with CancelGuard(self.connection, up):  # abort the engine if the client disconnects while we wait on it
+            up.begin()
             if up.status != 200:
                 return self.send_json(up.status, {"error": {"type": "api_error", "message": up.raw().decode(errors="replace")[:500]}})
-            self.start_sse()
-            anthropic_stream(self, up, model, meter)
-            return
-        up = Upstream("POST", "/v1/chat/completions", chat)
-        if up.status != 200:
-            return self.send_json(up.status, {"error": {"type": "api_error", "message": up.raw().decode(errors="replace")[:500]}})
-        resp = up.json()
-        meter.done(resp.get("usage"))
-        self.send_json(200, chat_to_anthropic(resp, model))
+            if streaming:
+                self.start_sse()
+                anthropic_stream(self, up, model, meter)
+                return
+            resp = up.json()
+            meter.done(resp.get("usage"))
+            self.send_json(200, chat_to_anthropic(resp, model))
 
     def handle_responses(self, body):
         model = body.get("model") or MODEL_ALIAS
         chat = responses_to_chat(body)
         meter = Meter("responses", MODEL_ALIAS or model)
-        if chat.get("stream"):
+        streaming = bool(chat.get("stream"))
+        if streaming:
             chat["stream_options"] = {"include_usage": True}
-            up = Upstream("POST", "/v1/chat/completions", chat)
+        up = Upstream("POST", "/v1/chat/completions", chat)
+        with CancelGuard(self.connection, up):  # abort the engine if the client disconnects while we wait on it
+            up.begin()
             if up.status != 200:
                 return self.send_json(up.status, {"error": {"type": "server_error", "message": up.raw().decode(errors="replace")[:500]}})
-            self.start_sse()
-            responses_stream(self, up, model, body, meter)
-            return
-        up = Upstream("POST", "/v1/chat/completions", chat)
-        if up.status != 200:
-            return self.send_json(up.status, {"error": {"type": "server_error", "message": up.raw().decode(errors="replace")[:500]}})
-        resp = up.json()
-        meter.done(resp.get("usage"))
-        self.send_json(200, chat_to_responses(resp, model, body))
+            if streaming:
+                self.start_sse()
+                responses_stream(self, up, model, body, meter)
+                return
+            resp = up.json()
+            meter.done(resp.get("usage"))
+            self.send_json(200, chat_to_responses(resp, model, body))
 
 
 class Server(ThreadingHTTPServer):
