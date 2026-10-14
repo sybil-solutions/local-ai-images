@@ -311,6 +311,17 @@ def main():
         check("models passthrough", status == 200 and body["data"][0]["id"] == "fake-model", str(body))
         status, body = call("/v1/models", key="")
         check("missing key is 401", status == 401, str(status))
+        # A key file that is empty (being written) or gone refuses every request, with or without a key
+        for state in ("empty", "missing"):
+            if state == "empty":
+                open(key_file.name, "w").close()
+            else:
+                os.unlink(key_file.name)
+            for given in ("", KEY):
+                status, _ = call("/v1/chat/completions", {"model": "x", "messages": [{"role": "user", "content": "hi"}]}, key=given)
+                check(f"{state} key file refuses a request {'with the old key' if given else 'without a key'}", status == 401, str(status))
+        with open(key_file.name, "w") as handle:
+            handle.write(KEY + "\n")
         status, body = call("/v1/chat/completions", {"model": "anything", "messages": [{"role": "user", "content": "hi"}]})
         check("chat passthrough maps the model alias", status == 200 and FakeEngine.last_request["model"] == "fake-model", str(body))
         for path in ("/v1/chat/completions", "/v1/completions"):

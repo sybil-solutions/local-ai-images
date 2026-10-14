@@ -10,9 +10,11 @@ UPSTREAM (default http://engine:8000), which speaks OpenAI chat completions.
   /v1/responses                      OpenAI Responses    -> chat completions
   /health                            200 when the engine answers /v1/models
 
-Auth: when GATEWAY_KEY_FILE names a non-empty file, every request must carry
-its value as `Authorization: Bearer <key>` or `x-api-key: <key>`. The file is
-read on each request, so the plugin can rotate the key without a restart.
+Auth: when GATEWAY_KEY_FILE is set, every request must carry the file's value
+as `Authorization: Bearer <key>` or `x-api-key: <key>`. The file is read on
+each request, so the plugin can rotate the key without a restart. A missing,
+unreadable or empty file refuses every request (only /health answers): a key
+being written or replaced never opens the gateway.
 
 Usage: when GATEWAY_USAGE_LOG names a file, one JSON line per answered
 request is appended to it: {t, api, model, prompt, completion, estimated,
@@ -41,6 +43,7 @@ socket that peeks empty means the client is gone, not merely done sending.
 Standard library only. No configuration beyond the environment above.
 """
 
+import hmac
 import http.client
 import json
 import os
@@ -70,13 +73,15 @@ def log(msg):
 
 
 def required_key():
+    """The key every request must carry: "" when no key file is configured, None when it is configured but missing,
+    unreadable or empty, which refuses everything."""
     if not KEY_FILE:
         return ""
     try:
         with open(KEY_FILE) as handle:
-            return handle.read().strip()
+            return handle.read().strip() or None
     except OSError:
-        return ""
+        return None
 
 
 class Meter:
@@ -633,11 +638,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def authorized(self):
         key = required_key()
-        if not key:
+        if key == "":
             return True
+        if key is None:
+            return False
         auth = self.headers.get("Authorization", "")
         given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "").strip()
-        return given == key
+        return hmac.compare_digest(given.encode(), key.encode())
 
     def read_body(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -828,7 +835,7 @@ class Server(ThreadingHTTPServer):
 
 def main():
     server = Server(("0.0.0.0", PORT), Handler)
-    log(f"gateway listening on :{PORT}, engine {UPSTREAM}, key {'required' if required_key() else 'not set'}, usage log {USAGE_LOG or 'off'}")
+    log(f"gateway listening on :{PORT}, engine {UPSTREAM}, key {'not set' if required_key() == '' else 'required'}, usage log {USAGE_LOG or 'off'}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
