@@ -1,0 +1,108 @@
+name: multiarch-index
+# Combine an amd64 and an arm64 image, each already built and attested by release-image.yml, into one multi-arch
+# index under a tag. Nothing is rebuilt: the index references the two published manifests by digest. Both sources
+# must carry a release-image build attestation from this repository; the index and each platform manifest in it then
+# get their own build attestation from this workflow, so `gh attestation verify` works on any of the three digests.
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: directory/package name (e.g. gateway)
+        required: true
+      tag:
+        description: tag for the multi-arch index (e.g. org-v6)
+        required: true
+      amd64:
+        description: sha256 digest of the linux/amd64 release-image build
+        required: true
+      arm64:
+        description: sha256 digest of the linux/arm64 release-image build
+        required: true
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+jobs:
+  index:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check sources (release-image attestation + platform)
+        id: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ inputs.image }}
+          AMD64: ${{ inputs.amd64 }}
+          ARM64: ${{ inputs.arm64 }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${OWNER,,}/${IMAGE}"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          for pair in "linux/amd64 $AMD64" "linux/arm64 $ARM64"; do
+            set -- $pair; want=$1; d=$2
+            case "$d" in sha256:[0-9a-f]*) ;; *) echo "::error::bad digest '$d'"; exit 1;; esac
+            gh attestation verify "oci://$repo@$d" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-image.yml" --format json \
+              | jq -e 'length > 0' >/dev/null
+            plats=$(docker buildx imagetools inspect "$repo@$d" --raw \
+              | jq -r 'if .manifests then [.manifests[] | select(.platform.os != "unknown") | .platform.os + "/" + .platform.architecture] | join(",") else "single" end')
+            [ "$plats" = "$want" ] || { echo "::error::$d platforms '$plats' != '$want'"; exit 1; }
+            echo "- $want source \`$repo@$d\`: release-image attestation verified" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Create the index
+        id: idx
+        env:
+          REPO: ${{ steps.src.outputs.repo }}
+          TAG: ${{ inputs.tag }}
+          AMD64: ${{ inputs.amd64 }}
+          ARM64: ${{ inputs.arm64 }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "$REPO:$TAG" "$REPO@$AMD64" "$REPO@$ARM64"
+          raw=$(docker buildx imagetools inspect "$REPO:$TAG" --raw)
+          echo "$raw" | jq .
+          digest=$(docker buildx imagetools inspect "$REPO:$TAG" --format '{{ json .Manifest }}' | jq -r .digest)
+          case "$digest" in sha256:*) ;; *) echo "::error::no index digest"; exit 1;; esac
+          amd=$(echo "$raw" | jq -r '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="amd64")] | if length==1 then .[0].digest else error("amd64 count") end')
+          arm=$(echo "$raw" | jq -r '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="arm64")] | if length==1 then .[0].digest else error("arm64 count") end')
+          echo "index=$digest" >> "$GITHUB_OUTPUT"
+          echo "amd64=$amd" >> "$GITHUB_OUTPUT"
+          echo "arm64=$arm" >> "$GITHUB_OUTPUT"
+      - name: Attest the index
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ steps.src.outputs.repo }}
+          subject-digest: ${{ steps.idx.outputs.index }}
+          push-to-registry: true
+      - name: Attest the linux/amd64 manifest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ steps.src.outputs.repo }}
+          subject-digest: ${{ steps.idx.outputs.amd64 }}
+          push-to-registry: true
+      - name: Attest the linux/arm64 manifest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ steps.src.outputs.repo }}
+          subject-digest: ${{ steps.idx.outputs.arm64 }}
+          push-to-registry: true
+      - name: Record
+        env:
+          REPO: ${{ steps.src.outputs.repo }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          {
+            echo "## $REPO:$TAG"
+            echo "- index: \`$REPO@${{ steps.idx.outputs.index }}\`"
+            echo "- linux/amd64: \`${{ steps.idx.outputs.amd64 }}\` (source ${{ inputs.amd64 }})"
+            echo "- linux/arm64: \`${{ steps.idx.outputs.arm64 }}\` (source ${{ inputs.arm64 }})"
+            echo "- verify: \`gh attestation verify oci://$REPO@${{ steps.idx.outputs.index }} --owner ${{ github.repository_owner }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
