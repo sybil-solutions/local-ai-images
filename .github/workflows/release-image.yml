@@ -465,8 +465,8 @@ jobs:
               ;;
             vllm-xpu)
               # Intel XPU vLLM images (llm-scaler-vllm). CPU-only, no GPU: the entrypoint is the repo's, vLLM imports under
-              # the oneAPI environment the entrypoint sets up and reports the labelled version, and `vllm serve --help`
-              # parses the serving flags. Device discovery and inference stay hardware gates.
+              # the oneAPI environment the entrypoint sets up and reports the labelled version, and the server and CLI modules
+              # import. Device discovery, flag parsing and inference stay hardware gates.
               run(){ timeout 600 docker run --rm --network none --memory 8g --cpus 2 "$@"; }
               want=$(sha256sum "$IMAGE/xpu-entrypoint.sh" | cut -d' ' -f1)
               got=$(run --entrypoint sha256sum "$ref" /opt/omarchy/xpu-entrypoint.sh | cut -d' ' -f1)
@@ -480,10 +480,10 @@ jobs:
               rel(){ echo "$1" | sed -E 's/^([^+]+\+g[0-9a-f]+).*/\1/'; }
               echo "vllm $v (label $label)"; test -n "$v" && test "$(rel "$v")" = "$(rel "$label")"
               pass "vllm $v imports under the oneAPI environment and matches the engine.version label ($(rel "$label"))"
-              H=$(run --entrypoint bash "$ref" -c "$env; vllm serve /tmp/none --help=all" 2>&1 || true)
-              for f in --served-model-name --max-model-len --gpu-memory-utilization --tool-call-parser --reasoning-parser --speculative-config; do
-                echo "$H" | grep -q -- "$f" || { echo "::error::flag $f missing"; echo "$H" | tail -20; exit 1; }; done
-              pass "vllm serve parses and lists the serving flags"
+              # `vllm serve --help` builds a VllmConfig, which needs a detected XPU ("Failed to infer device type") on a CPU
+              # runner, so the server is checked by importing its stack and the CLI entry point instead.
+              run --entrypoint bash "$ref" -c "$env; python3 -c 'import vllm.entrypoints.openai.api_server, vllm.entrypoints.cli.main' && vllm --version"
+              pass "OpenAI API server and vllm CLI modules import; vllm --version runs (flag parsing needs a device)"
               ;;
             *) echo "::error::unknown engine '$e'"; exit 1;;
           esac
