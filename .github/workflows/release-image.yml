@@ -31,7 +31,7 @@ on:
         required: false
         default: ""
       engine:
-        description: "smoke mode: sglang | vllm | tabby | llama | dsv41 | gateway | exl3xpu | sglang-exl3 (CPU checks)"
+        description: "smoke mode: sglang | vllm | tabby | llama | dsv41 | gateway | exl3xpu | sglang-exl3 | exl3-rocm | vllm-xpu (CPU checks)"
         required: false
         default: ""
       namespace:
@@ -178,7 +178,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: inputs.engine == 'dsv41' || inputs.engine == 'gateway' || inputs.image == 'exl3xpu-trellis'
+        if: inputs.engine == 'dsv41' || inputs.engine == 'gateway' || inputs.engine == 'exl3-rocm' || inputs.engine == 'vllm-xpu' || inputs.image == 'exl3xpu-trellis'
       - name: Free runner disk
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
@@ -444,6 +444,43 @@ jobs:
               pass "every extension carries SASS for the labelled archs ($want)"
               run --entrypoint /opt/sglang/bin/python3 "$ref" -m sglang.launch_server --model-path /tmp/none --tool-call-parser qwen3_coder --reasoning-parser qwen3 --help >/dev/null
               pass "launch_server accepts --tool-call-parser qwen3_coder --reasoning-parser qwen3"
+              ;;
+            exl3-rocm)
+              # ROCm ExLlamaV3 + TabbyAPI images (exl3-rdna4). CPU-only, no GPU, no model: the recipe commit is the pinned one,
+              # torch is a ROCm build, the exllamav3 HIP extension and TabbyAPI's dependencies import, TabbyAPI's own config
+              # schema validates the baked config.yml, and the entrypoint refuses to start without the models.
+              run(){ timeout 300 docker run --rm --network none --memory 8g --cpus 2 "$@"; }
+              want=$(sed -n 's/^ARG RECIPE_COMMIT=//p' "$IMAGE/Dockerfile")
+              got=$(run --entrypoint cat "$ref" /opt/recipe/container/RECIPE_COMMIT)
+              test -n "$want" && test "$want" = "$got"
+              pass "recipe commit $got matches the Dockerfile pin"
+              run --entrypoint bash "$ref" -c 'source setup/env.sh && if compgen -G "exllamav3/exllamav3_ext*.so" >/dev/null; then export PYTHONPATH=/opt/recipe/exllamav3; fi && python -c "import torch; assert torch.version.hip, torch.__version__; import exllamav3, exllamav3_ext, fastapi, uvicorn, sse_starlette, huggingface_hub; print(\"torch\", torch.__version__, \"hip\", torch.version.hip)"'
+              pass "ROCm torch, exllamav3 + its HIP extension, TabbyAPI dependencies import (setup/env.sh environment)"
+              R=$(run --entrypoint bash -w /opt/recipe/tabbyAPI "$ref" -c 'source ../setup/env.sh && python -c "import yaml,importlib; m=importlib.import_module(\"common.config_models\"); C=next(c for n in dir(m) for c in [getattr(m,n)] if hasattr(c,\"model_fields\") and \"network\" in getattr(c,\"model_fields\",{})); cfg=C(**yaml.safe_load(open(\"config.yml\"))); mo=cfg.model; print(\"CONFIG_SCHEMA_OK\", C.__name__, \"max_seq_len=%s cache_size=%s\" % (mo.max_seq_len, mo.cache_size))"')
+              echo "$R"; echo "$R" | grep -q CONFIG_SCHEMA_OK
+              pass "TabbyAPI config schema validates the baked tabbyAPI/config.yml ($(echo "$R" | grep -o 'max_seq_len.*'))"
+              if out=$(run "$ref" 2>&1); then echo "::error::entrypoint started without models"; exit 1; fi
+              echo "$out" | grep -q 'missing in /models' || { echo "::error::unexpected entrypoint failure: $out"; exit 1; }
+              pass "entrypoint fails closed without mounted models"
+              ;;
+            vllm-xpu)
+              # Intel XPU vLLM images (llm-scaler-vllm). CPU-only, no GPU: the entrypoint is the repo's, vLLM imports under
+              # the oneAPI environment the entrypoint sets up and reports the labelled version, and `vllm serve --help`
+              # parses the serving flags. Device discovery and inference stay hardware gates.
+              run(){ timeout 600 docker run --rm --network none --memory 8g --cpus 2 "$@"; }
+              want=$(sha256sum "$IMAGE/xpu-entrypoint.sh" | cut -d' ' -f1)
+              got=$(run --entrypoint sha256sum "$ref" /opt/omarchy/xpu-entrypoint.sh | cut -d' ' -f1)
+              test "$want" = "$got"
+              pass "installed entrypoint matches $IMAGE/xpu-entrypoint.sh"
+              label=$(docker inspect "$ref" --format '{{ index .Config.Labels "ai.omarchy.engine.version" }}')
+              env='source /opt/intel/oneapi/setvars.sh --force >/dev/null; source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force >/dev/null'
+              v=$(run --entrypoint bash "$ref" -c "$env; python3 -c 'import vllm; print(vllm.__version__)'" | tail -1)
+              echo "vllm $v (label $label)"; test "$v" = "$label"
+              pass "vllm $v imports under the oneAPI environment and matches the engine.version label"
+              H=$(run --entrypoint bash "$ref" -c "$env; vllm serve /tmp/none --help=all" 2>&1 || true)
+              for f in --served-model-name --max-model-len --gpu-memory-utilization --tool-call-parser --reasoning-parser --speculative-config; do
+                echo "$H" | grep -q -- "$f" || { echo "::error::flag $f missing"; echo "$H" | tail -20; exit 1; }; done
+              pass "vllm serve parses and lists the serving flags"
               ;;
             *) echo "::error::unknown engine '$e'"; exit 1;;
           esac
