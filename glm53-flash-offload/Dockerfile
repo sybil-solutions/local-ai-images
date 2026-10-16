@@ -22,6 +22,7 @@
 #   bit-identical; glm-flash-lite PR #7). usage.completion_tokens counts across max_rq_tokens requeues (PR #8).
 #   GLM53_MODE=nvme defaults on: N135 CPU-lane forward (PR #10) + N136 decode lookahead / fast nv_pub / side-stream
 #   prefetch guess / MLA block-table trim (PR #11), each settable to 0 (PR #12).
+#   Decode lookahead no longer stalls after a max_rq_tokens requeue (glm-flash-lite PR #18), so GLM53_LA=0 is not needed.
 #   GLM53_B70=1 (default off, nvme mode only): optional B70 expert tier; needs the companion image
 #   glm53-b70-expert-server on one Arc Pro B70 and a shared tmpfs dir at /run/local-ai/shared (PR #9, campaign N137:
 #   55 GiB decode C1 17.5 -> 26.5, C4 19.1 -> 33.5, decode KL 0.0034).
@@ -67,7 +68,7 @@ RUN git clone https://github.com/turboderp-org/exllamav3 /opt/exllamav3-src \
 
 # Serving code at the pinned commit; fail closed if the checkout is anything else.
 ARG GLM53_REPO=https://github.com/sybil-solutions/glm-flash-lite
-ARG GLM53_COMMIT=0fbc0c569772863f9ae02730c3a3549a2b3b25f6
+ARG GLM53_COMMIT=0bd10f371abdcdb8c3648453f9da834c6dd2c980
 LABEL ai.omarchy.glm53-flash-offload.commit="${GLM53_COMMIT}"
 RUN git init -q /opt/glm53 \
  && cd /opt/glm53 \
