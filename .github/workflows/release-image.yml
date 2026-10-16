@@ -475,8 +475,11 @@ jobs:
               label=$(docker inspect "$ref" --format '{{ index .Config.Labels "ai.omarchy.engine.version" }}')
               env='source /opt/intel/oneapi/setvars.sh --force >/dev/null; source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force >/dev/null'
               v=$(run --entrypoint bash "$ref" -c "$env; python3 -c 'import vllm; print(vllm.__version__)'" | tail -1)
-              echo "vllm $v (label $label)"; test "$v" = "$label"
-              pass "vllm $v imports under the oneAPI environment and matches the engine.version label"
+              # The build suffix after the commit differs (.xpu in Intel's tag, .dYYYYMMDD in __version__); the release and
+              # source commit must match.
+              rel(){ echo "$1" | sed -E 's/^([^+]+\+g[0-9a-f]+).*/\1/'; }
+              echo "vllm $v (label $label)"; test -n "$v" && test "$(rel "$v")" = "$(rel "$label")"
+              pass "vllm $v imports under the oneAPI environment and matches the engine.version label ($(rel "$label"))"
               H=$(run --entrypoint bash "$ref" -c "$env; vllm serve /tmp/none --help=all" 2>&1 || true)
               for f in --served-model-name --max-model-len --gpu-memory-utilization --tool-call-parser --reasoning-parser --speculative-config; do
                 echo "$H" | grep -q -- "$f" || { echo "::error::flag $f missing"; echo "$H" | tail -20; exit 1; }; done
