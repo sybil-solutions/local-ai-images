@@ -482,8 +482,9 @@ jobs:
               pass "vllm $v imports under the oneAPI environment and matches the engine.version label ($(rel "$label"))"
               # `vllm serve --help` builds a VllmConfig, which needs a detected XPU ("Failed to infer device type") on a CPU
               # runner, so the server is checked by importing its stack and the CLI entry point instead.
-              run --entrypoint bash "$ref" -c "$env; python3 -c 'import vllm.entrypoints.openai.api_server, vllm.entrypoints.cli.main' && vllm --version"
-              pass "OpenAI API server and vllm CLI modules import; vllm --version runs (flag parsing needs a device)"
+              # (`vllm --version` builds every subparser too, so it fails the same way.)
+              run --entrypoint bash "$ref" -c "$env; python3 -c 'import vllm.entrypoints.openai.api_server, vllm.entrypoints.cli.main' && command -v vllm"
+              pass "OpenAI API server and vllm CLI modules import; vllm is on PATH (argument parsing needs a device)"
               ;;
             *) echo "::error::unknown engine '$e'"; exit 1;;
           esac
