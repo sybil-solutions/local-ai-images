@@ -23,6 +23,8 @@ permissions:
   packages: write
   id-token: write
   attestations: write
+  # attest-build-provenance v4 also records the pushed image as a storage record (create-storage-record defaults on)
+  artifact-metadata: write
 jobs:
   index:
     if: github.ref == 'refs/heads/main'
