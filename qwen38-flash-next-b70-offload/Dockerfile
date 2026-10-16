@@ -26,19 +26,23 @@ LABEL ai.omarchy.hardware="intel-arc-pro-b70-32gb"
 LABEL ai.omarchy.model.repo="turboderp/Qwen3.8-Flash-Next-exl3"
 LABEL ai.omarchy.model.revision="69e33439ae950f17bcbe95c98f117d80f759ab6d"
 
-ARG QWEN_B70_REPO=https://github.com/sybil-solutions/qwen38-flash-next-b70-offload
-ARG QWEN_B70_COMMIT=2f108fbe52c4173c3acf63f66bf64a9b12580619
+# Serving code now lives in sybil-solutions/qwen-serve (qwen3.8-flash-next/b70-offload); the old repository is archived.
+# d163a2f: Qwen4-Exp MTP draft shim + MTP MoE layer pinned in the RAM tier (NEXTN MTP works in both tier modes).
+ARG QWEN_B70_REPO=https://github.com/sybil-solutions/qwen-serve
+ARG QWEN_B70_COMMIT=d163a2f0dc47ab41c299eb8dca06520ef077b098
+ARG QWEN_B70_DIR=qwen3.8-flash-next/b70-offload
 LABEL ai.omarchy.qwen38-flash-next-b70-offload.commit="${QWEN_B70_COMMIT}"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN git init -q /opt/qwen-b70 \
- && cd /opt/qwen-b70 \
+RUN git init -q /tmp/qwen-serve \
+ && cd /tmp/qwen-serve \
  && git fetch -q --depth 1 "${QWEN_B70_REPO}" "${QWEN_B70_COMMIT}" \
  && git checkout -q --detach FETCH_HEAD \
  && test "$(git rev-parse HEAD)" = "${QWEN_B70_COMMIT}" \
+ && mv "/tmp/qwen-serve/${QWEN_B70_DIR}" /opt/qwen-b70 \
  && echo "${QWEN_B70_COMMIT}" > /opt/qwen-b70/COMMIT \
- && rm -rf .git
+ && rm -rf /tmp/qwen-serve
 
 # Kernels: _moe_a8.so (NVMe-tier MoE kernels) and the SYCL sparse attention + selection library.
 RUN bash /opt/qwen-b70/kernels/moe-a8/build.sh \
