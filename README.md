@@ -18,7 +18,9 @@ libraries with no GPU devices and does not qualify model serving.
 
 | Image | Base | Why it exists |
 |---|---|---|
-| `exl3xpu-trellis` | Intel vLLM XPU 0.26.0-b2 by digest | The trellis-serve vLLM XPU launcher with its shared core at a pinned source commit. Preserves the former trellis publisher's build and launch definition; distinct from standalone exl3xpu and the SGLang XPU variant. CPU import/parser smoke does not qualify hardware inference. |
+| `exl3xpu-trellis` | Intel vLLM XPU 0.26.0-b2 by digest | The trellis-serve vLLM XPU launcher with its shared core at a pinned source commit. Preserves the former trellis publisher's image identity; `exl3xpu` now uses the same maintained source and layout. Separate from the SGLang XPU variant. CPU import/parser smoke does not qualify hardware inference. |
+| `deploy-llamacpp-qwen38-q4km-intel-arc-pro-b70-32gb` | Intel oneAPI Basekit 2025.3.2 by digest (**linux/amd64**) | Qwen3.8-27B Q4_K_M on one or two Intel Arc Pro B70 cards: the SYCL llama.cpp build and launcher from [qwen-serve](https://github.com/sybil-solutions/qwen-serve/tree/e21b0229727fed42e4d5f12ead5d9687b7ff9545/qwen3.8/b70), pinned `mndodd/llama.cpp` plus the vendored TP2/Q4K patches. One image covers `qwen38-q4km-arcb70-llamacpp-tp1` (`GPU_COUNT=1`, 131072 context) and `qwen38-q4km-arcb70-llamacpp-tp2` (`GPU_COUNT=2`, 262144 context, `ENABLE_VISION=1` for the CPU projector). Weights mounted at `/models`, target GGUF SHA256 checked at every start, `/dev/dri` and `/dev/dri/by-path` passthrough, API port 8010. Replaces the archived qwen38-b70 publisher; GPU serving still needs exact-image acceptance. |
+| `deploy-sglang-deepseek-v41-flash-4x-rtx-pro-6000` | SGLang by digest (**linux/amd64**) | The [DeepSeek-V4.1-Flash 4x RTX PRO 6000 result](https://github.com/sybil-solutions/deepseek-v4.1-flash-4x-rtx-pro-6000/tree/f27f4c398ab637f6eac214ff84ebd85283019351): pinned launcher, Engram row-store adapter and SM120 FlashMLA runtime for four 96 GB Blackwell GPUs, 128 GB host RAM and local NVMe. Preserves TP4/EP4, DSpark block 5, bounded replay and default `OFFLOAD_MODE=nvme` with a 64 GiB cache. Original FP4/FP8/BF16 checkpoint, not EXL3; pinned model download with per-file integrity checks. Mount `/models` and `/state`; authenticated API port 8010, key in `/state/api-key`. Full image build and hardware/quality acceptance remain separate from CPU adapter checks. |
 | `gateway` | `python:3.12-slim` by digest | the plugin's one endpoint: OpenAI chat passes through, Anthropic Messages and OpenAI Responses are translated to the engine's chat completions, streaming and tool calls included; enforces the share key when one is set. `python3 gateway/test.py` runs its tests against a fake engine. |
 | `tabbyapi-exl3` | `ghcr.io/theroyallab/tabbyapi:cu13` by digest | adds `python3-dev` and `build-essential`; without Python headers Triton cannot JIT ExLlamaV3's gated-delta-net kernels, so Qwen3.5 and Qwen3.8 fail to load |
 | `llamacpp-prism` | `nvidia/cuda:12.8.1-runtime-ubuntu24.04` by digest | Prism ML's llama.cpp fork, whose ternary kernels are the only ones that load `Ternary-Bonsai-2-27B`'s `PTQ1_0`/`PQ2_0` packings; stock llama.cpp rejects them as unknown types. Ships the release tarball verified against its published `sha256`, a shim entrypoint that serves both the recipe argv and the campaign's SSH bootstrap, and `openssh-server` so the bootstrap does not need to install it |
@@ -39,4 +41,10 @@ run summary, and pin it in the registry recipe together with a link to the run.
 
 Existing `ghcr.io/0xsero/...@sha256:...` releases keep their original namespace and certificate identity. New builds publish to the current repository owner. Smoke checks accept an explicit `namespace` for historical releases; no recipe is repinned by a repository transfer.
 
-`exl3xpu` is built from the exact pinned runtime commit, and `llamacpp-bonsai` preserves the former registry-only definition. Retire source-repo publishers only after validating their canonical replacements.
+`exl3xpu` now fetches `sybil-solutions/trellis-serve` at
+`c7c883729d72db9220d1085015798ab490609d7c`, installs its shared `core`, and builds
+the maintained `xpu/` tree in the existing `/opt/exl3xpu` layout. The Intel base
+digest, plugin entry point, model configuration and default launch command are
+unchanged; it no longer fetches the archived standalone repository.
+`llamacpp-bonsai` preserves the former registry-only definition. Retire
+source-repo publishers only after validating their canonical replacements.
