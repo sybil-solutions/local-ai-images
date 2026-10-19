@@ -27,7 +27,7 @@ LABEL ai.omarchy.model.repo="turboderp/GLM-5.3-Flash-exl3"
 LABEL ai.omarchy.model.revision="332ab457b709b7ba30dd9a448be5de03b80a7ac9"
 
 ARG GLM_REPO=https://github.com/sybil-solutions/glm-flash-lite
-ARG GLM_COMMIT=d0f956580e50efa43e6cdd84115ee868ef284c17
+ARG GLM_COMMIT=68aaa623ad3aa16f25c6614312d207eaaa3fea0d
 LABEL ai.omarchy.glm-flash-lite.commit="${GLM_COMMIT}"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
