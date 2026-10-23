@@ -1,13 +1,21 @@
-# exl3xpu: EXL3 inference on Intel Arc (Battlemage) via vLLM XPU.
+# exl3xpu: EXL3 inference on Intel Arc (Battlemage) via vLLM XPU, built from
+# sybil-solutions/trellis-serve xpu/ + core/ (supersedes archived sybil-solutions/exl3xpu).
 FROM intel/llm-scaler-vllm:0.26.0-b2@sha256:52218ad85513ab6686d4c090c83c2bd8c5b02423c63aa4dabd41837fe641fe3b
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-WORKDIR /opt/exl3xpu
-ARG EXL3XPU_COMMIT=15ded2f3add148c4db3c900cba7de878238f53bc
-RUN git init . && git remote add origin https://github.com/sybil-solutions/exl3xpu.git \
- && git fetch --depth 1 origin "$EXL3XPU_COMMIT" && git checkout --detach FETCH_HEAD \
- && test "$(git rev-parse HEAD)" = "$EXL3XPU_COMMIT"
+ARG TRELLIS_SERVE_COMMIT=a1f72be2ff6319b9b2ea9bf6768c99664b1ca892
+RUN git init -q /opt/trellis-serve && cd /opt/trellis-serve \
+ && git fetch -q --depth 1 https://github.com/sybil-solutions/trellis-serve "${TRELLIS_SERVE_COMMIT}" \
+ && git checkout -q --detach FETCH_HEAD \
+ && test "$(git rev-parse HEAD)" = "${TRELLIS_SERVE_COMMIT}" \
+ && echo "${TRELLIS_SERVE_COMMIT}" > COMMIT && rm -rf .git \
+ && cp -a core /opt/trellis-core \
+ && mkdir /opt/exl3xpu \
+ && cp -a xpu/pyproject.toml xpu/exl3xpu xpu/csrc xpu/scripts xpu/models xpu/bench xpu/tests /opt/exl3xpu/
 LABEL org.opencontainers.image.source="https://github.com/sybil-solutions/local-ai-images"
+LABEL ai.omarchy.trellis-serve.commit="${TRELLIS_SERVE_COMMIT}"
+RUN pip install --no-deps --no-build-isolation -e /opt/trellis-core
+WORKDIR /opt/exl3xpu
 RUN bash scripts/build_ext.sh && pip install --no-deps --no-build-isolation -e . \
  && python3 -c "from importlib.metadata import entry_points as e; assert any(x.name=='exl3xpu' for x in e(group='vllm.general_plugins'))"
 ENV MODELS_DIR=/models

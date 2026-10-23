@@ -45,4 +45,4 @@ run summary, and pin it in the registry recipe together with a link to the run.
 
 Existing `ghcr.io/0xsero/...@sha256:...` releases keep their original namespace and certificate identity. New builds publish to the current repository owner. Smoke checks accept an explicit `namespace` for historical releases; no recipe is repinned by a repository transfer.
 
-`exl3xpu` is built from the exact pinned runtime commit, and `llamacpp-bonsai` preserves the former registry-only definition. Retire source-repo publishers only after validating their canonical replacements.
+`exl3xpu` is built from `sybil-solutions/trellis-serve` `xpu/` + `core/` at the exact pinned commit (replacing the archived standalone `sybil-solutions/exl3xpu` / `trellis2-b70` repo), and `llamacpp-bonsai` preserves the former registry-only definition. Retire source-repo publishers only after validating their canonical replacements.
