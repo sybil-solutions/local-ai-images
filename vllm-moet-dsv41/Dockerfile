@@ -1,8 +1,12 @@
 # ghcr.io/sybil-solutions/vllm-moet-dsv41: DeepSeek-V4.1-Flash(-1017) on 4x RTX PRO 6000 Blackwell (sm_120), TP4.
 #
-# kacper-daftcode/vLLM-Moet @ 5d25cff (Apache-2.0), Dockerfile.sm120-dsv41-nightly = the "-r13" image: vLLM nightly
-# df3bd094 + Dockerfile steps 1-28 (MXFP8 GEMV, FP4 KV record, MXFP4 indexer, b12x MoE at TP4 with the fused decode
-# kernel, sparse-MLA gather loads, MXFP8 lm_heads, PCIe P2P all-reduce in NCCL's order, DSpark k=7 support).
+# kacper-daftcode/vLLM-Moet @ b0dc737 (Apache-2.0), Dockerfile.sm120-dsv41-nightly = the "-r21" image: vLLM nightly
+# df3bd094 + Dockerfile steps 1-36 (MXFP8 GEMV, FP4 KV record, MXFP4 indexer, b12x MoE at TP4 with the fused decode
+# kernel, sparse-MLA gather loads, MXFP8 lm_heads, PCIe P2P all-reduce in NCCL's order, DSpark k=7 support, the
+# drafter's input prep for all KV groups in one launch, DSA candidate blocks on the deterministic top-k, the SWA
+# decode and draft metadata builds in one launch each, the shared-expert add fused into the MoE top-k sum, the MoE
+# rows quantization on a side stream - most behind VLLM_MOET_* runtime switches, default off; step 37, the MoE
+# routing megakernel, is not built, as upstream builds it).
 # Below: that file from its first stage on, unchanged except that (a) the vLLM-Moet source comes from the pinned
 # GitHub archive instead of the build context (the two COPY lines read --from=src) and (b) FROM names the base digest
 # directly (release-image.yml requires a literal @sha256 pin). Then one layer of ours, engram_disk (MIT): with
@@ -12,7 +16,7 @@
 # No GPU needed to build (every extension sets its CUDA arch). Serve: see README.md.
 
 FROM vllm/vllm-openai:nightly-df3bd094aeea829f27baa0a5282830464f601d9f@sha256:b91d90a63b75d00e780287e4236123a281ee3d29122c864a7044a19a680fdf9d AS src
-ADD --checksum=sha256:4fcc0b374e040370ddbcb7870899c6ac4a8c047b9098775c4e57bce0e5927f94 https://github.com/kacper-daftcode/vLLM-Moet/archive/5d25cff77495e9a260420c3ec6ee35a96bb2056d.tar.gz /tmp/moet.tgz
+ADD --checksum=sha256:662f927cab375608fcd43f7335befa0dbbfec4b74d99ed3ac785c54c3a740820 https://github.com/kacper-daftcode/vLLM-Moet/archive/b0dc737ae431d9a2ab3f62ed3fc30313b00d99c1.tar.gz /tmp/moet.tgz
 RUN mkdir -p /src && tar -xzf /tmp/moet.tgz -C /src --strip-components=1 && rm /tmp/moet.tgz
 
 # ---------------------------------------------------------------- deep_gemm
@@ -214,18 +218,71 @@ RUN if [ "$VLLM_MOET_B12X_MOE_FUSED_PATCH" = "1" ]; then python3 /opt/vllm-moet/
     && grep -q "_moet_moe_fused_on" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_b12x_moe_fused_sm120/*.so; fi
 
-# 28. The sparse MLA decode's rows gathered by plain loads + the merge with its loads issued up front (runtime switch
-#     VLLM_MOET_SPARSE_MLA_LDG=1, default off); the extension is compiled here against the installed FlashInfer's headers.
+# 28. The sparse MLA decode's rows gathered by plain loads, shared conversion, speculative index loads, the softmax / XV
+#     section with 4 barriers per tile + the merge with its loads issued up front (runtime switch VLLM_MOET_SPARSE_MLA_LDG=1,
+#     default off); the kernel text is generated from the installed FlashInfer header and the extension compiled here.
 #     GPU test: tools/dsv41_sm120/sparse_mla_ldg/test_sparse_mla_ldg_sm120.py.
 ARG VLLM_MOET_SPARSE_MLA_LDG_PATCH=1
 RUN if [ "$VLLM_MOET_SPARSE_MLA_LDG_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_flashinfer_sparse_mla_ldg_sm120.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/sparse_mla_ldg'); import sparse_mla_ldg_sm120 as m; e = m._ext(); assert hasattr(e, 'sparse_mla_decode_ldg'); print('sm120 sparse MLA load-based gather extension built')" \
+    && python3 -c "import sys, pathlib; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/sparse_mla_ldg'); import gen_spec_kernel as g; g.check(pathlib.Path('/opt/vllm-moet/torch_extensions/vllm_moet_sparse_mla_ldg_sm120/sparse_mla_spec_kernel.inc')); print('generated decode kernel == installed header + the recorded insertions')" \
     && python3 -c "import flashinfer.mla._sparse_mla_sm120._prepared as p; assert hasattr(p, '_moet_sparse_mla_ldg_on') and hasattr(p, '_moet_sparse_mla_ldg_execute_fn'); print('sparse MLA prepare/execute patched')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_sparse_mla_ldg_sm120/*.so; fi
 
+# 30. The DSpark / DFlash drafter's input preparation for all draft KV-cache groups in one launch instead of one per group
+#     (runtime switch VLLM_MOET_DFLASH_PREP_GROUPS=1, default off; Triton, no extension). GPU test:
+#     tools/dsv41_sm120/dflash_prep_groups/test_dflash_prep_groups_sm120.py.
+ARG VLLM_MOET_DFLASH_PREP_GROUPS_PATCH=1
+RUN if [ "$VLLM_MOET_DFLASH_PREP_GROUPS_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_dflash_prepare_groups_sm120.py \
+    && python3 -c "import vllm.v1.worker.gpu.spec_decode.dflash.speculator as s; assert hasattr(s, '_moet_prepare_dflash_inputs_groups_kernel') and hasattr(s, '_moet_prepare_dflash_inputs_groups'); print('drafter input prep for all KV groups patched')"; fi
+
+# 31. The DSA candidate-block selection (the candidate-source indexer's top 2048 blocks) on step 26's deterministic top-k
+#     kernel instead of torch.topk's ~20 launches (runtime switch VLLM_MOET_CANDIDATE_DET_TOPK=1, default off; needs step
+#     26's extension, built above). GPU test: tools/dsv41_sm120/candidate_short/test_candidate_short_sm120.py.
+ARG VLLM_MOET_CANDIDATE_DET_TOPK_PATCH=1
+RUN if [ "$VLLM_MOET_CANDIDATE_DET_TOPK_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_candidate_short_sm120.py \
+    && python3 -c "import vllm.model_executor.kernels.attention.dsa.candidate_blocks as c; assert hasattr(c, '_moet_candidates_det') and hasattr(c, '_moet_candidates_fixup_kernel'); print('candidate blocks on the deterministic top-k patched')"; fi
+
+# 32. Each SWA metadata builder's decode build (validity + lens tail + indices) in one Triton launch instead of three
+#     (runtime switch VLLM_MOET_SWA_DECODE_BUILD=1, default off). GPU test: tools/dsv41_sm120/swa_decode_build/test_swa_decode_build_sm120.py.
+ARG VLLM_MOET_SWA_DECODE_BUILD_PATCH=1
+RUN if [ "$VLLM_MOET_SWA_DECODE_BUILD_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_swa_decode_build_sm120.py \
+    && python3 -c "import vllm.v1.attention.backends.mla.sparse_swa as s; assert hasattr(s, '_moet_swa_decode_build_kernel') and hasattr(s, '_moet_swa_decode_build'); print('SWA decode build in one launch patched')"; fi
+
+# 33. The shared-expert add fused into b12x's top-k sum of the compact-micro decode MoE (runtime switch
+#     VLLM_MOET_MOE_TOPKSUM_ADD=1, default off; Triton, no extension). GPU test: tools/dsv41_sm120/moe_topksum_add/test_moe_topksum_add_sm120.py.
+ARG VLLM_MOET_MOE_TOPKSUM_ADD_PATCH=1
+RUN if [ "$VLLM_MOET_MOE_TOPKSUM_ADD_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_topksum_add_sm120.py \
+    && python3 -c "import flashinfer.experimental.b12x.moe.fused_moe._impl as i, vllm.model_executor.layers.fused_moe.runner.moe_runner as r; assert hasattr(i, '_moet_topksum_add_launch') and hasattr(r, '_moet_topksum_add_begin') and hasattr(r, '_moet_topksum_add_end'); print('top-k sum + shared-expert add patched')"; fi
+
+# 34. The decode MoE's rows quantization on a side stream before the router, handed to the fused MoE (runtime switch
+#     VLLM_MOET_MOE_PREQUANT=1, default off; no new kernel). Checked end to end on pb-deep (greedy agreement with the det switches).
+ARG VLLM_MOET_MOE_PREQUANT_PATCH=1
+RUN if [ "$VLLM_MOET_MOE_PREQUANT_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_prequant_sm120.py \
+    && python3 -c "import vllm.model_executor.layers.fused_moe.runner.moe_runner as r, flashinfer.experimental.b12x.moe._shared.kernels.w4a8_compact_micro as m; assert hasattr(r, '_moet_prequant_begin') and hasattr(r, '_moet_prequant_take') and hasattr(m, '_moet_prequant_take'); print('MoE rows quantization off the critical path patched')"; fi
+
+# 36. The DSpark drafter's non-causal SWA metadata update (validity + token -> request map + indices) in one Triton
+#     launch instead of three, per SWA builder inside the drafter's graph (runtime switch VLLM_MOET_SWA_DRAFT_BUILD=1,
+#     default off). GPU test: tools/dsv41_sm120/swa_draft_build/test_swa_draft_build_sm120.py.
+ARG VLLM_MOET_SWA_DRAFT_BUILD_PATCH=1
+RUN if [ "$VLLM_MOET_SWA_DRAFT_BUILD_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_swa_draft_build_sm120.py \
+    && python3 -c "import vllm.v1.attention.backends.mla.sparse_swa as s; assert hasattr(s, '_moet_swa_draft_build_kernel') and hasattr(s, '_moet_swa_draft_build'); print('SWA draft build in one launch patched')"; fi
+
+# 37. The MoE sublayer's routing (router spread GEMM + DeepSeek-V4 top-6) folded into the fused decode MoE launch: one
+#     persistent kernel from the router's input to route_output (runtime switch VLLM_MOET_MOE_MEGA=1; the deferral in
+#     dsv4_topk_sm120 / bf16_gemm, the launch site in w4a8_compact_micro.py on top of steps 27 and 34). Measured slower
+#     in the served graph (see the header) - opt-in: the default 0 leaves it out of the image; =1 patches the launch site
+#     and compiles the extension here. GPU test: tools/dsv41_sm120/b12x_moe_mega/test_b12x_moe_mega_sm120.py.
+ARG VLLM_MOET_MOE_MEGA_PATCH=0
+RUN if [ "$VLLM_MOET_MOE_MEGA_PATCH" = "1" ] && [ "$VLLM_MOET_B12X_MOE_FUSED_PATCH" = "1" ] && [ "$VLLM_MOET_MOE_PREQUANT_PATCH" = "1" ]; then \
+    python3 /opt/vllm-moet/dsv41_sm120/patch_flashinfer_b12x_moe_mega_sm120.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/b12x_moe_mega'); import b12x_moe_mega_sm120 as f; e = f._ext(); assert hasattr(e, 'moe_mega'); print('sm120 b12x MoE sublayer megakernel extension built')" \
+    && grep -q "_moet_mega_take" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_b12x_moe_mega_sm120/*.so; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV + the MoE router's top-6 in a plain-launched CUDA kernel bit-identical to Triton's + DSpark's Markov sampling in one launch per draft step + the target's lm_head on the MXFP8 GEMV (runtime switch) + b12x's MoE FC2 grouped by expert + a deterministic DSA indexer top-k (runtime switch) + b12x's decode MoE in one persistent kernel (runtime switch) + the sparse MLA decode's rows gathered by plain loads and its merge with hoisted loads (runtime switch)" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV + the MoE router's top-6 in a plain-launched CUDA kernel bit-identical to Triton's + DSpark's Markov sampling in one launch per draft step + the target's lm_head on the MXFP8 GEMV (runtime switch) + b12x's MoE FC2 grouped by expert + a deterministic DSA indexer top-k (runtime switch) + b12x's decode MoE in one persistent kernel (runtime switch) + the sparse MLA decode's rows gathered by plain loads, its softmax / XV section with four barriers per tile and its merge with hoisted loads (runtime switch) + the drafter's input preparation in one launch for all draft KV groups (runtime switch) + the DSA candidate-block selection on the deterministic top-k (runtime switch) + the SWA builders' decode build in one launch (runtime switch) + the shared-expert add fused into the MoE top-k sum (runtime switch) + the MoE rows quantization on a side stream before the router (runtime switch) + the DSpark drafter's SWA metadata update in one launch per builder (runtime switch)" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.flashinfer="base" \
       com.vllm-moet.decoder-replay="upstream" \
@@ -249,6 +306,13 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.det-topk="${VLLM_MOET_DET_TOPK_PATCH}" \
       com.vllm-moet.b12x-moe-fused="${VLLM_MOET_B12X_MOE_FUSED_PATCH}" \
       com.vllm-moet.sparse-mla-ldg="${VLLM_MOET_SPARSE_MLA_LDG_PATCH}" \
+      com.vllm-moet.dflash-prep-groups="${VLLM_MOET_DFLASH_PREP_GROUPS_PATCH}" \
+      com.vllm-moet.candidate-det-topk="${VLLM_MOET_CANDIDATE_DET_TOPK_PATCH}" \
+      com.vllm-moet.swa-decode-build="${VLLM_MOET_SWA_DECODE_BUILD_PATCH}" \
+      com.vllm-moet.moe-topksum-add="${VLLM_MOET_MOE_TOPKSUM_ADD_PATCH}" \
+      com.vllm-moet.moe-prequant="${VLLM_MOET_MOE_PREQUANT_PATCH}" \
+      com.vllm-moet.swa-draft-build="${VLLM_MOET_SWA_DRAFT_BUILD_PATCH}" \
+      com.vllm-moet.moe-mega="${VLLM_MOET_MOE_MEGA_PATCH}" \
       com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}"
 
 # ---------------------------------------------------------------- engram_disk (ours)
@@ -259,9 +323,9 @@ RUN gcc -O2 -fPIC -shared -pthread -o /opt/vllm-moet/engram_disk/libengram_disk.
  && python3 -c "import vllm.models.deepseek_v41.common.engram as e; assert hasattr(e, '_MoetEngramDisk'); import vllm.model_executor.model_loader.weight_utils as w; assert hasattr(w, '_moet_should_skip_weight'); print('engram disk ok')"
 ENV VLLM_MOET_ENGRAM_DISK=1
 LABEL com.vllm-moet.engram-disk="1" \
-      com.vllm-moet.source="https://github.com/kacper-daftcode/vLLM-Moet/tree/5d25cff77495e9a260420c3ec6ee35a96bb2056d" \
+      com.vllm-moet.source="https://github.com/kacper-daftcode/vLLM-Moet/tree/b0dc737ae431d9a2ab3f62ed3fc30313b00d99c1" \
       org.opencontainers.image.source="https://github.com/sybil-solutions/local-ai-images" \
-      org.opencontainers.image.description="vLLM-Moet r13 (DeepSeek-V4.1-Flash, sm_120, TP4) + Engram tables read from NVMe" \
+      org.opencontainers.image.description="vLLM-Moet r21 (DeepSeek-V4.1-Flash, sm_120, TP4) + Engram tables read from NVMe" \
       ai.omarchy.engine="vllm" \
       ai.omarchy.hardware="rtx-pro-6000-blackwell-96gb" \
       ai.omarchy.cuda.archs="12.0" \

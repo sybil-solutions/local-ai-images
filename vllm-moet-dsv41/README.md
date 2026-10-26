@@ -9,7 +9,7 @@ reasoning and tool calls. OpenAI-compatible API from `vllm serve` (the image's e
 | component | pin | licence |
 |---|---|---|
 | base `vllm/vllm-openai:nightly-df3bd094…` (vLLM main 2026-10-20, torch 2.14, FlashInfer 0.7.2) | `sha256:b91d90a6…fdf9d` | Apache-2.0 |
-| [kacper-daftcode/vLLM-Moet](https://github.com/kacper-daftcode/vLLM-Moet) `Dockerfile.sm120-dsv41-nightly` ("-r13", steps 1-28) | `5d25cff77495e9a260420c3ec6ee35a96bb2056d` (archive sha256 `4fcc0b37…7f94`) | Apache-2.0 (LICENSE + NOTICE in `/opt/vllm-moet/`) |
+| [kacper-daftcode/vLLM-Moet](https://github.com/kacper-daftcode/vLLM-Moet) `Dockerfile.sm120-dsv41-nightly` ("-r21", steps 1-36; step 37 not built, as upstream) | `b0dc737ae431d9a2ab3f62ed3fc30313b00d99c1` (archive sha256 `662f927c…0820`) | Apache-2.0 (LICENSE + NOTICE in `/opt/vllm-moet/`) |
 | DeepGEMM (vllm-project fork, rebuilt with vLLM-Moet's SM120 patch) | `727f847082d2e7946f70dc02b94949db206310d3` | MIT |
 | `engram_disk` (this directory) | this commit | MIT |
 | model (not in the image) | `deepseek-ai/DeepSeek-V4.1-Flash-1017@1bae0e1088993b9b82de08f59de5be5a34e42170` | MIT (DeepSeek) |
@@ -29,11 +29,14 @@ function between an async copy of the row ids and the unchanged lookup kernel). 
 
 The recipe (launch, measured numbers, quality gate) lives in
 [local-ai-registry](https://github.com/sybil-solutions/local-ai-registry):
-`registry/launches/vllm-moet-deepseek-v4.1-flash-1017-512k-tp4.json`. Speed switches as measured there:
-`VLLM_MOET_B12X_MOE_FUSED=1 VLLM_MOET_SPARSE_MLA_LDG=1 VLLM_MOET_TARGET_LM_HEAD_MXFP8=1 VLLM_MOET_P2P_AR=1
-VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=16 NCCL_P2P_LEVEL=SYS NCCL_P2P_DISABLE=0`, `--moe-backend b12x`, DSpark k = 7 with
-`"moe_backend":"b12x"`. First start ~22 min (FlashInfer autotune + DeepGEMM JIT; mount a cache at `/root/.cache`
-and `/root/.deep_gemm`, `--gpu-memory-utilization 0.92` that once), later ~7 min.
+`registry/launches/vllm-moet-deepseek-v4.1-flash-1017-512k-tp4-r21.json`. Speed switches as measured there (vLLM-Moet's
+Fraser-bench configuration): `VLLM_MOET_B12X_MOE_FUSED=1 VLLM_MOET_SPARSE_MLA_LDG=1 VLLM_MOET_TARGET_LM_HEAD_MXFP8=1
+VLLM_MOET_P2P_AR=1 VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=8 VLLM_MOET_P2P_AG=0 VLLM_MOET_DFLASH_PREP_GROUPS=1
+VLLM_MOET_CANDIDATE_DET_TOPK=1 VLLM_MOET_SWA_DECODE_BUILD=1 VLLM_MOET_MOE_TOPKSUM_ADD=1 VLLM_MOET_SWA_DRAFT_BUILD=1
+NCCL_P2P_LEVEL=SYS NCCL_P2P_DISABLE=0`, `--moe-backend b12x`, DSpark k = 7 with `"moe_backend":"b12x"`. First start
+~22 min (FlashInfer autotune + DeepGEMM JIT; mount a cache at `/root/.cache` and `/root/.deep_gemm`,
+`--gpu-memory-utilization 0.92` that once), later ~7 min. The r13 image (`5d25cff`) stays published under its digest
+for `vllm-moet-deepseek-v4.1-flash-1017-512k-tp4`.
 
 ## Build
 
