@@ -1,0 +1,2141 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -211,6 +211,22 @@
+             if kv_cache_config.kv_cache_groups[group.group_id].is_eagle_group
+         }
+ 
++        if spec.extra_config.get("dspark_mixed_target_groups", False):
++            if (vllm_config.speculative_config is None
++                    or not vllm_config.speculative_config.use_dspark()):
++                raise ValueError("dspark_mixed_target_groups requires DSpark")
++            for group_id in eagle_groups:
++                names = kv_cache_config.kv_cache_groups[group_id].layer_names
++                if not (any(n.startswith("language_model.") for n in names)
++                        and any(n.startswith("model.") for n in names)):
++                    raise ValueError("DSpark override requires mixed target/draft groups")
++            logger.warning(
++                "DSpark mixed target/draft groups %s: retain all target chunks; "
++                "disable draft-tail dropping for offload only. Drafts remain verified.",
++                sorted(eagle_groups),
++            )
++            eagle_groups = set()
++
+         use_eagle_block_drop = (
+             vllm_config.speculative_config is not None
+             and vllm_config.speculative_config.use_eagle_block_drop()
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -61,6 +61,7 @@
+     VLLM_XLA_CHECK_RECOMPILATION: bool = False
+     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
++    VLLM_DSPARK_ADAPTIVE_MIN_REQS: int | None = None
+     VLLM_XPU_PP_MICROBATCH: bool = True
+     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
+     VLLM_XLA_USE_SPMD: bool = False
+@@ -1102,6 +1103,15 @@
+     "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": lambda: int(
+         os.getenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "8192")
+     ),
++    # Hybrid adaptive verification: with enable_adaptive_verification, only steps
++    # of more than this many requests verify adaptively; steps of at most this
++    # many verify every draft, as with adaptive verification off. Unset: every
++    # step verifies adaptively.
++    "VLLM_DSPARK_ADAPTIVE_MIN_REQS": lambda: (
++        int(os.environ["VLLM_DSPARK_ADAPTIVE_MIN_REQS"])
++        if os.environ.get("VLLM_DSPARK_ADAPTIVE_MIN_REQS", "").strip()
++        else None
++    ),
+     # If set, the OpenAI API server will stay alive even after the underlying
+     # AsyncLLMEngine errors and stops serving requests
+     "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH": lambda: bool(
+--- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+@@ -863,7 +863,14 @@
+         intermediate_size = round_up(intermediate_size, 128)
+         hidden_size = round_up(hidden_size, 128)
+     elif backend in (Mxfp4MoeBackend.MARLIN, Mxfp4MoeBackend.BATCHED_MARLIN):
+-        intermediate_size = round_up(intermediate_size, 128)
++        # vllm#56697 (backport, env-gated): SM90 W4A16-BF16 Marlin runs w13 and w2 with a 64-aligned
++        # intermediate dim when hidden is padded to 256. TP4 DeepSeek-V4.1-Flash: 576 stays 576 instead of 640.
++        import os as _os
++        _align = int(_os.environ.get("DSV41_MARLIN_IALIGN", "128"))
++        if not (backend == Mxfp4MoeBackend.MARLIN and current_platform.is_cuda()
++                and current_platform.is_device_capability(90)):
++            _align = 128
++        intermediate_size = round_up(intermediate_size, _align)
+         if current_platform.is_xpu():
+             hidden_size = round_up(hidden_size, 128)
+         else:
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -1245,6 +1245,8 @@
+                 for name in f.keys():  # noqa: SIM118
+                     if should_skip_weight(name, local_expert_ids):
+                         continue
++                    if os.environ.get("DSV41_ENGRAM_DISK", "0") == "1" and name.endswith((".engram.embed.weight", ".engram.embed.scale")):
++                        continue
+                     param = f.get_tensor(name)
+                     yield name, param
+ 
+--- a/vllm/models/deepseek_v41/common/engram.py
++++ b/vllm/models/deepseek_v41/common/engram.py
+@@ -970,10 +970,15 @@
+         cpu_offload: bool = False,
+         dp_shared_memory: bool = False,
+         use_thp: bool = False,
++        model_dir: str | None = None,
++        layer_id: int | None = None,
+     ) -> None:
+         super().__init__()
+         assert head_sizes and all(size > 0 for size in head_sizes)
+         assert sum(head_sizes) <= num_embeddings
++        # DSV41_ENGRAM_DISK=1 reads rows from the checkpoint on SSD
++        # (/opt/deepseek/ssd/disk_engram.py); ModelState stages them before replay.
++        self.disk_mode = os.environ.get("DSV41_ENGRAM_DISK", "0") == "1"
+         self.cpu_offload = cpu_offload
+         self.dp_shared_memory = dp_shared_memory
+         self.use_thp = use_thp
+@@ -1013,7 +1018,9 @@
+                 peer = current_platform.is_fully_connected(physical_ids)
+             if peer:
+                 peer_group, self.dp_size = group, 1
+-        if cpu_offload and not is_uva_available():
++        if self.disk_mode and (self.dp_size > 1 or dp_shared_memory):
++            raise ValueError("DSV41_ENGRAM_DISK=1 supports Engram DP size 1 only")
++        if cpu_offload and not self.disk_mode and not is_uva_available():
+             raise RuntimeError("Engram CPU offload requires UVA support")
+         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
+         self._view_src: tuple[int, int] | None = None
+@@ -1048,6 +1055,28 @@
+             torch.accelerator.current_device_index()
+         ).multi_processor_count
+         weight, scales = self._allocate_weights()
++        if self.disk_mode:
++            from disk_engram import DiskEngramTable
++
++            assert model_dir is not None and layer_id is not None
++            # Buffers, not parameters: the loader skips the checkpoint rows.
++            self.register_buffer("weight", weight, persistent=False)
++            self.register_buffer("weight_scale_inv", scales, persistent=False)
++            self.disk = DiskEngramTable(
++                model_dir,
++                layer_id,
++                dim,
++                block_size,
++                self.vocab_start_idx,
++                self.part_num_embeddings,
++            )
++            logger.info(
++                "SSD Engram layer %d: %d rows per rank, O_DIRECT, bounded batch "
++                "staging",
++                layer_id,
++                self.part_num_embeddings,
++            )
++            return
+         self.weight = nn.Parameter(weight, requires_grad=False)
+         self.weight_scale_inv = nn.Parameter(scales, requires_grad=False)
+         for param in (self.weight, self.weight_scale_inv):
+@@ -1079,6 +1108,11 @@
+ 
+     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+         scale_dim = self.dim // self.block_size
++        if self.disk_mode:
++            return (
++                torch.zeros((1, self.dim), dtype=torch.float8_e4m3fn, device="cpu"),
++                torch.zeros((1, scale_dim), dtype=torch.uint8, device="cpu"),
++            )
+         if torch.get_default_device().type == "meta" or not (
+             self.cpu_offload or self.peer_rows
+         ):
+@@ -1184,6 +1218,9 @@
+ 
+         `background` limits the grid to leave SMs for concurrent work.
+         """
++        if self.disk_mode:
++            self.disk.lookup(self, indices, out)
++            return
+         rows = indices.shape[0] * self.part_n_hash_cols
+         if not rows:
+             return
+@@ -1660,6 +1697,8 @@
+             cpu_offload=engram_config.cpu_offload,
+             dp_shared_memory=bool(engram_config.dp_shared_memory),
+             use_thp=engram_config.use_thp,
++            model_dir=get_current_vllm_config().model_config.model,
++            layer_id=layout.layer_ids[layer_hash_index],
+         )
+ 
+     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
+@@ -1670,6 +1709,11 @@
+             head_dim,
+             dtype=torch.bfloat16,
+         )
++        if self.embed_tokens.disk_mode:
++            # Rows come from DiskEngramStager before graph replay.
++            self.staged_rows.zero_()
++            self._prefetch_stream = None
++            return
+         if not self.embed_tokens.cpu_offload:
+             self._prefetch_stream = None
+             return
+@@ -1680,6 +1724,8 @@
+     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
+         """Look up, or prefetch from host memory, rows before the decoder layers
+         consume them; DP-sharded tables take the group's gathered hash IDs."""
++        if self.embed_tokens.disk_mode:
++            return  # ModelState staged rows before graph replay.
+         rows = self.staged_rows[: hash_ids.shape[0]]
+         assert rows.shape[0] == hash_ids.shape[0], "engram staging buffer too small"
+         if self._prefetch_stream is None:
+--- a/vllm/models/deepseek_v41/nvidia/flashmla.py
++++ b/vllm/models/deepseek_v41/nvidia/flashmla.py
+@@ -5,6 +5,7 @@
+ 
+ import torch
+ 
++from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.forward_context import get_forward_context
+ from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
+ from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+@@ -17,6 +18,12 @@
+     dsv41_o_proj,
+     register_dsv41_o_proj_warmup,
+ )
++from vllm.models.deepseek_v41.nvidia.ops.small_head_sparse_decode import (
++    register_small_head_decode_warmup,
++    small_head_decode_enabled,
++    small_head_decode_supported,
++    small_head_sparse_decode,
++)
+ from vllm.models.deepseek_v41.sparse_mla import (
+     DeepseekV4FlashMLABackend,
+     DeepseekV4FlashMLAMetadata,
+@@ -25,6 +32,7 @@
+ from vllm.platforms import current_platform
+ from vllm.utils.math_utils import round_up
+ from vllm.v1.attention.backend import AttentionCGSupport
++from vllm.v1.attention.backends.mla.compressor_utils import get_dspark_swa_index_width
+ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+ from vllm.v1.attention.ops.flashmla import (
+     flash_mla_sparse_fwd,
+@@ -65,6 +73,14 @@
+         )
+         register_dsv41_o_proj_warmup(self)
+         self._prefill_num_heads = self._get_prefill_num_heads()
++        # vllm#59418 backport: SM90 small-head sparse decode, off unless DSV41_SMALL_HEAD_DECODE=1.
++        import os as _os
++        self._use_small_head_decode = (_os.environ.get("DSV41_SMALL_HEAD_DECODE", "0") == "1"
++                                       and small_head_decode_enabled(self.n_local_heads))
++        vllm_config = get_current_vllm_config()
++        if self._use_small_head_decode and vllm_config.kernel_config.enable_jit_warmup:
++            self._register_small_head_decode_warmup(vllm_config)
++
+ 
+     def _get_prefill_num_heads(self) -> int:
+         return (
+@@ -73,6 +89,25 @@
+             and self.n_local_heads in (8, 16, 32)
+             else self.padded_heads
+         )
++    def _register_small_head_decode_warmup(self, vllm_config: VllmConfig) -> None:
++        swa_widths = [self.window_size]
++        spec_config = vllm_config.speculative_config
++        if spec_config is not None and spec_config.use_dspark():
++            swa_widths.append(
++                get_dspark_swa_index_width(
++                    self.window_size, spec_config.num_speculative_tokens
++                )
++            )
++        swa_only = self.compress_ratio == 0
++        register_small_head_decode_warmup(
++            num_heads=self.n_local_heads,
++            has_extra=not swa_only,
++            swa_widths=tuple(swa_widths),
++            topk=0 if swa_only else vllm_config.model_config.hf_config.index_topk,
++            swa_page_size=self.swa_cache_layer.block_size,
++            extra_page_size=vllm_config.cache_config.block_size
++            // max(self.compress_ratio, 1),
++        )
+ 
+     def _o_proj(self, attn_out: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+         return dsv41_o_proj(self, attn_out, positions)
+@@ -218,6 +253,30 @@
+         swa_indices = swa_metadata.decode_swa_indices
+         swa_lens = swa_metadata.decode_swa_lens
+ 
++        if self._use_small_head_decode:
++            assert swa_indices is not None
++            max_keys = swa_indices.shape[-1]
++            if topk_indices is not None:
++                max_keys += topk_indices.shape[-1]
++            use_small_head = small_head_decode_supported(num_decode_tokens, max_keys)
++        else:
++            use_small_head = False
++        if use_small_head:
++            small_head_sparse_decode(
++                q=q,
++                swa_cache=self.swa_cache_layer.kv_cache,
++                swa_indices=swa_indices,
++                swa_lens=swa_lens,
++                extra_cache=None if swa_only else kv_cache,
++                extra_indices=topk_indices,
++                extra_lens=topk_lens,
++                attn_sink=self.attn_sink,
++                sm_scale=self.scale,
++                out=output,
++                num_heads=self.n_local_heads,
++            )
++            return
++
+         # We treat queries in the same seq as different queries
+         # and later we only attend by generated indices.
+         # q arrives pre-padded to self.padded_heads by the outer wrapper.
+--- a/vllm/models/deepseek_v41/nvidia/model_state.py
++++ b/vllm/models/deepseek_v41/nvidia/model_state.py
+@@ -200,6 +200,10 @@
+         device: torch.device,
+     ):
+         super().__init__(vllm_config, model, encoder_cache, device)
++        from disk_engram import DiskEngramStager
++
++        # SSD Engram rows are read here, before graph replay.
++        self.disk_stager = DiskEngramStager(model)
+         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+         max_local_reqs = self.max_num_reqs * (2 if self.pcp_size > 1 else 1)
+         depth = model.token_lookback_depth
+@@ -312,6 +316,7 @@
+             BLOCK_DEPTH=triton.next_power_of_2(depth),
+         )
+         model_inputs["lookback_token_ids"] = window
++        self.disk_stager.stage(input_batch, model_inputs, window)
+         return model_inputs
+ 
+     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+--- a/vllm/models/deepseek_v41/nvidia/ops/cute_dsl/all_reduce_mhc.py
++++ b/vllm/models/deepseek_v41/nvidia/ops/cute_dsl/all_reduce_mhc.py
+@@ -22,6 +22,7 @@
+ from __future__ import annotations
+ 
+ import math
++import os
+ from typing import Any
+ 
+ import cuda.bindings.driver as cuda
+@@ -60,6 +61,9 @@
+     stmc_bf16x2,
+     stmc_bf16x4,
+     stmc_bf16x8,
++    stp2p_bf16x2,
++    stp2p_bf16x4,
++    stp2p_bf16x8,
+     store_global_u32,
+     store_global_u32x4,
+     store_lamport_sentinel_u32x4,
+@@ -69,6 +73,20 @@
+ )
+ 
+ LAMPORT_GENERATIONS = 3
++# Ranks the publishers store to one by one when NVLink multicast is absent
++# (``AllReduceMHC``: 0 means multicast); every instance of a process agrees.
++_PUBLISH_P2P_RANKS: int | None = None
++
++
++def publish_p2p_ranks() -> int:
++    """0 if mailboxes take multicast stores, else the TP size of the per-peer
++    store fallback; 0 before any ``AllReduceMHC`` exists."""
++    return _PUBLISH_P2P_RANKS or 0
++
++
++def p2p_fallback_enabled() -> bool:
++    """``DSV41_MHC_P2P=0`` turns the per-peer store fallback off."""
++    return os.environ.get("DSV41_MHC_P2P", "1") != "0"
+ NEXT_STAGE = 0
+ ACTIVE_STAGE = 1
+ # One UE8M0 scale per 32 values: four adjacent threads' BF16 fragments.
+@@ -126,6 +144,7 @@
+         threads: int,
+         release_before_store: bool,
+         enable_pdl: bool,
++        p2p: int = 0,
+     ) -> None:
+         if elements_per_thread not in (1, QUAD_BF16, VEC_BF16):
+             raise ValueError("elements_per_thread must be 1, 4, or 8")
+@@ -141,6 +160,8 @@
+         self.ctas_per_token = math.ceil(self.fragments / threads)
+         self.release_before_store = release_before_store
+         self.enable_pdl = enable_pdl
++        # Nonzero: the mailbox address is a [p2p] table of peer bases.
++        self.p2p = p2p
+ 
+     @cute.jit
+     def __call__(
+@@ -242,30 +263,54 @@
+                     (Int64(stage) * self.tp + self.rank) * self.capacity_m
+                     + Int64(token)
+                 ) * self.hidden + Int64(fragment)
+-                stmc_bf16x2(
+-                    contribution_mailbox_multicast_address + mailbox_element * 2,
+-                    packed_word,
+-                )
++                if cutlass.const_expr(self.p2p):
++                    stp2p_bf16x2(
++                        contribution_mailbox_multicast_address,
++                        mailbox_element * Int64(2),
++                        packed_word,
++                        self.p2p,
++                    )
++                else:
++                    stmc_bf16x2(
++                        contribution_mailbox_multicast_address + mailbox_element * 2,
++                        packed_word,
++                    )
+         elif cutlass.const_expr(self.elements_per_thread == QUAD_BF16):
+             if fragment < self.fragments:
+                 mailbox_element = (
+                     (Int64(stage) * self.tp + self.rank) * self.capacity_m
+                     + Int64(token)
+                 ) * self.hidden + Int64(fragment) * QUAD_BF16
+-                stmc_bf16x4(
+-                    contribution_mailbox_multicast_address + mailbox_element * 2,
+-                    packed_words,
+-                )
++                if cutlass.const_expr(self.p2p):
++                    stp2p_bf16x4(
++                        contribution_mailbox_multicast_address,
++                        mailbox_element * Int64(2),
++                        packed_words,
++                        self.p2p,
++                    )
++                else:
++                    stmc_bf16x4(
++                        contribution_mailbox_multicast_address + mailbox_element * 2,
++                        packed_words,
++                    )
+         else:
+             if fragment < self.fragments:
+                 mailbox_element = (
+                     (Int64(stage) * self.tp + self.rank) * self.capacity_m
+                     + Int64(token)
+                 ) * self.hidden + Int64(fragment) * VEC_BF16
+-                stmc_bf16x8(
+-                    contribution_mailbox_multicast_address + mailbox_element * 2,
+-                    packed_words,
+-                )
++                if cutlass.const_expr(self.p2p):
++                    stp2p_bf16x8(
++                        contribution_mailbox_multicast_address,
++                        mailbox_element * Int64(2),
++                        packed_words,
++                        self.p2p,
++                    )
++                else:
++                    stmc_bf16x8(
++                        contribution_mailbox_multicast_address + mailbox_element * 2,
++                        packed_words,
++                    )
+ 
+         if cutlass.const_expr(not self.release_before_store):
+             if block == 0 and tidx == 0:
+@@ -294,6 +339,7 @@
+         enable_pdl: bool,
+         prefetch_group: int,
+         fp32_weights: bool = False,
++        p2p: int = 0,
+     ) -> None:
+         if hidden <= 0 or hidden % QUAD_BF16:
+             raise ValueError("hidden must be a positive multiple of 4")
+@@ -312,6 +358,8 @@
+         self.prefetch_group = prefetch_group
+         self.prefetch_groups = (top_k + prefetch_group - 1) // prefetch_group
+         self.fp32_weights = fp32_weights
++        # Nonzero: the mailbox address is a [p2p] table of peer bases.
++        self.p2p = p2p
+ 
+     def smem_size_in_bytes(self) -> int:
+         return self.top_k * 8
+@@ -516,10 +564,18 @@
+             mailbox_element = (
+                 (Int64(stage) * self.tp + self.rank) * self.capacity_m + Int64(token)
+             ) * self.hidden + Int64(fragment) * QUAD_BF16
+-            stmc_bf16x4(
+-                contribution_mailbox_multicast_address + mailbox_element * 2,
+-                packed,
+-            )
++            if cutlass.const_expr(self.p2p):
++                stp2p_bf16x4(
++                    contribution_mailbox_multicast_address,
++                    mailbox_element * Int64(2),
++                    packed,
++                    self.p2p,
++                )
++            else:
++                stmc_bf16x4(
++                    contribution_mailbox_multicast_address + mailbox_element * 2,
++                    packed,
++                )
+ 
+         if block == 0 and tidx == 0:
+             store_global_u32(
+@@ -999,6 +1055,47 @@
+         rank = dist.get_rank(group)
+         device = torch.device(device)
+ 
++        # The mailbox comes first: whether it maps multicast decides how the
++        # publish kernels store.
++        with torch.accelerator.device_index(device.index):
++            self._mailbox = symm_mem.empty(
++                (LAMPORT_GENERATIONS, tp, capacity, hidden),
++                dtype=torch.bfloat16,
++                device=device,
++            )
++            self._mailbox_handle = symm_mem.rendezvous(self._mailbox, group)
++            multicast = int(self._mailbox_handle.multicast_ptr or 0)
++            self.p2p = 0
++            if multicast:
++                if multicast % 16:
++                    raise RuntimeError("misaligned NVLink multicast mapping")
++                self._multicast = multicast
++            else:
++                # No multicast (no NVSwitch): every publisher stores its slot
++                # into each rank's copy through the P2P mapped peer buffers.
++                peers = [int(ptr) for ptr in self._mailbox_handle.buffer_ptrs]
++                if not p2p_fallback_enabled():
++                    raise RuntimeError(
++                        "NVLink multicast mapping is unavailable "
++                        "(DSV41_MHC_P2P=0 disables the per-peer fallback)"
++                    )
++                if len(peers) != tp or any(not ptr or ptr % 16 for ptr in peers):
++                    raise RuntimeError("peer mailbox mappings are unavailable")
++                # int64 addresses; the kernels read them as u64.
++                self._peer_table = torch.tensor(
++                    peers, dtype=torch.int64, device=device
++                )
++                self._multicast = self._peer_table.data_ptr()
++                self.p2p = tp
++            # Every slot starts as the Lamport sentinel, BF16 negative zero.
++            self._mailbox.view(torch.int16).fill_(-32768)
++            self._stage_state = torch.zeros(2, dtype=torch.int32, device=device)
++            torch.accelerator.synchronize()
++        global _PUBLISH_P2P_RANKS
++        if _PUBLISH_P2P_RANKS is not None and _PUBLISH_P2P_RANKS != self.p2p:
++            raise RuntimeError("mailboxes of one process disagree on multicast")
++        _PUBLISH_P2P_RANKS = self.p2p
++
+         # FlashInfer's LL_ALL_REDUCE_GB300_TP{4,8}_H5120 and
+         # LL_FINALIZE_..._H5120_K* presets: a cluster of 5 x 128 threads covers
+         # a 640-fragment token in one fully used trip, and the finalize stages
+@@ -1014,6 +1111,7 @@
+                     threads=128,
+                     release_before_store=False,
+                     enable_pdl=True,
++                    p2p=self.p2p,
+                 ),
+                 make_fake_dynamic_compact_tensor(
+                     BFloat16, alignment=16, divisibility=hidden
+@@ -1038,6 +1136,7 @@
+                     enable_pdl=True,
+                     prefetch_group=top_k,
+                     fp32_weights=True,
++                    p2p=self.p2p,
+                 ),
+                 make_fake_dynamic_compact_tensor(
+                     BFloat16, alignment=16, divisibility=hidden
+@@ -1137,20 +1236,6 @@
+                     hidden, dtype=torch.bfloat16, device=device
+                 )
+ 
+-            self._mailbox = symm_mem.empty(
+-                (LAMPORT_GENERATIONS, tp, capacity, hidden),
+-                dtype=torch.bfloat16,
+-                device=device,
+-            )
+-            self._mailbox_handle = symm_mem.rendezvous(self._mailbox, group)
+-            multicast = int(self._mailbox_handle.multicast_ptr or 0)
+-            if not multicast or multicast % 16:
+-                raise RuntimeError("NVLink multicast mapping is unavailable")
+-            self._multicast = multicast
+-            # Every slot starts as the Lamport sentinel, BF16 negative zero.
+-            self._mailbox.view(torch.int16).fill_(-32768)
+-            self._stage_state = torch.zeros(2, dtype=torch.int32, device=device)
+-            torch.accelerator.synchronize()
+         dist.barrier(group=group)
+ 
+     def __call__(
+--- a/vllm/models/deepseek_v41/nvidia/ops/cute_dsl/primitives.py
++++ b/vllm/models/deepseek_v41/nvidia/ops/cute_dsl/primitives.py
+@@ -359,6 +359,76 @@
+     )
+ 
+ 
++# Per-peer stores, the fallback for ``stmc_*`` where NVLink multicast is absent
++# (no NVSwitch, e.g. a bridged H200 NVL node). ``peers`` is the device address of
++# an int64 table of every rank's mailbox base (symmetric memory ``buffer_ptrs``,
++# P2P mapped), ``offset`` the byte offset of the slot in each copy. One
++# ``st.relaxed.sys`` per rank, own rank included, in rank order: every copy
++# receives the bytes the multicast store would have written. All address
++# arithmetic is 64-bit (u64 registers, ``l`` operands).
++def _p2p_store_asm(vector: str, words: int, tp: int) -> str:
++    operands = ", ".join(f"${2 + index}" for index in range(words))
++    stores = "".join(
++        f"ld.global.u64 p2p_base, [$0+{8 * peer}];\n"
++        f"add.u64 p2p_base, p2p_base, $1;\n"
++        f"st.relaxed.sys.global{vector}.b32 [p2p_base], "
++        + (f"{{{operands}}};\n" if words > 1 else f"{operands};\n")
++        for peer in range(tp)
++    )
++    return "{\n.reg .u64 p2p_base;\n" + stores + "}"
++
++
++@dsl_user_op
++def stp2p_bf16x2(
++    peers: Int64, offset: Int64, packed: Uint32, tp: int, *, loc=None, ip=None
++) -> None:
++    _asm(
++        None,
++        [
++            peers.ir_value(loc=loc, ip=ip),
++            offset.ir_value(loc=loc, ip=ip),
++            packed.ir_value(loc=loc, ip=ip),
++        ],
++        _p2p_store_asm("", 1, tp),
++        "l,l,r",
++        side_effects=True,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@dsl_user_op
++def stp2p_bf16x4(
++    peers: Int64, offset: Int64, values, tp: int, *, loc=None, ip=None
++) -> None:
++    words = [values[index].ir_value(loc=loc, ip=ip) for index in range(2)]
++    _asm(
++        None,
++        [peers.ir_value(loc=loc, ip=ip), offset.ir_value(loc=loc, ip=ip), *words],
++        _p2p_store_asm(".v2", 2, tp),
++        "l,l,r,r",
++        side_effects=True,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@dsl_user_op
++def stp2p_bf16x8(
++    peers: Int64, offset: Int64, values, tp: int, *, loc=None, ip=None
++) -> None:
++    words = [values[index].ir_value(loc=loc, ip=ip) for index in range(4)]
++    _asm(
++        None,
++        [peers.ir_value(loc=loc, ip=ip), offset.ir_value(loc=loc, ip=ip), *words],
++        _p2p_store_asm(".v4", 4, tp),
++        "l,l,r,r,r,r",
++        side_effects=True,
++        loc=loc,
++        ip=ip,
++    )
++
++
+ class _GraphSafeDLPack:
+     __slots__ = ("tensor",)
+ 
+--- a/vllm/models/deepseek_v41/nvidia/ops/mhc.py
++++ b/vllm/models/deepseek_v41/nvidia/ops/mhc.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Dispatch DSV4.1 mHC operations and overlap coefficient generation."""
+ 
++import os
+ from functools import cache, partial
+ from typing import TYPE_CHECKING, cast
+ 
+@@ -81,9 +82,19 @@
+     ):
+         return False
+     # The custom all-reduce's MNNVL buffers succeed exactly when NVLink
+-    # multicast does, which the fused kernel's own mailbox needs too.
++    # multicast does, which the fused kernel's own mailbox uses. Without it
++    # (no NVSwitch), Hopper ranks that are NVLink all-to-all take the mailbox's
++    # per-peer store fallback (DSV41_MHC_P2P=0 turns it off).
+     comm = cast("CudaCommunicator", get_tp_group().device_communicator).ca_comm
+-    return comm is not None and bool(comm.mnnvl_lamport_ag_multicast_ptr)
++    if comm is None or comm.disabled:
++        return False
++    if comm.mnnvl_lamport_ag_multicast_ptr:
++        return True
++    return (
++        current_platform.is_device_capability(90)
++        and bool(comm.fully_connected)
++        and os.environ.get("DSV41_MHC_P2P", "1") != "0"
++    )
+ 
+ 
+ def init_mhc_all_reduce(vllm_config: VllmConfig) -> None:
+--- a/vllm/models/deepseek_v41/nvidia/ops/small_head_sparse_decode.py
++++ b/vllm/models/deepseek_v41/nvidia/ops/small_head_sparse_decode.py
+@@ -0,0 +1,476 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Sparse MLA decode for DeepSeek V4.1 on SM90 with few query heads per rank.
++
++FlashMLA's SM90 sparse decode kernel tiles heads by 64 (the WGMMA M
++dimension), so a TP8 shard with 8 heads wastes 7/8 of its tensor-core work.
++This kernel tiles heads by 16 through ``tl.dot`` (mma.sync on SM90) and splits
++the key set across programs instead.
++
++KV cache layout (``fp8_ds_mla``, 584 B/token): each page holds
++``page_size`` rows of 448 fp8 NoPE bytes + 64 bf16 RoPE values, followed by
++``page_size`` rows of 8 UE8M0 scale bytes (7 used, one per 64 NoPE dims).
++V is the full 512-dim key, so one dequantized tile feeds both GEMMs.
++"""
++
++import torch
++
++from vllm.model_executor.warmup.jit_warmup import WarmupChoices, WarmupIntRange
++from vllm.model_executor.warmup.jit_warmup_triton_helper import (
++    DispatchSpec,
++    TritonWarmupTensor,
++    triton_kernel_dispatcher_with_warmup,
++)
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++
++
++def small_head_decode_enabled(num_local_heads: int) -> bool:
++    if num_local_heads not in (8, 16):
++        return False
++    return current_platform.is_device_capability_family(90)
++
++
++@triton.jit
++def _load_kv_block(
++    cache_ptr,
++    page_stride,
++    page_size,
++    indices_ptr,
++    idx_base,
++    limit,
++    key_offs,
++    BLOCK_N: tl.constexpr,
++):
++    """Gather and dequantize BLOCK_N keys into a [BLOCK_N, 512] bf16 tile."""
++    offs = key_offs + tl.arange(0, BLOCK_N)
++    in_range = offs < limit
++    token = tl.load(indices_ptr + idx_base + offs, mask=in_range, other=-1)
++    valid = in_range & (token >= 0)
++    safe = tl.where(valid, token, 0)
++    page = (safe // page_size).to(tl.int64)
++    row = (safe % page_size).to(tl.int64)
++    page_base = cache_ptr + page * page_stride
++    data_base = page_base + row * 576
++
++    d = tl.arange(0, 512)
++    is_nope = d < 448
++    raw = tl.load(
++        data_base[:, None] + d[None, :],
++        mask=valid[:, None] & is_nope[None, :],
++        other=0,
++    )
++    nope = raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++
++    t = tl.arange(0, 8)
++    enc = tl.load(
++        (page_base + page_size * 576 + row * 8)[:, None] + t[None, :],
++        mask=valid[:, None] & (t[None, :] < 7),
++        other=127,
++    )
++    scale = tl.exp2(enc.to(tl.float32) - 127.0)
++    nope = tl.reshape(
++        tl.reshape(nope, (BLOCK_N, 8, 64)) * scale[:, :, None], (BLOCK_N, 512)
++    )
++
++    rope_ptr = (data_base + 448).to(tl.pointer_type(tl.bfloat16))
++    rope = tl.load(
++        rope_ptr[:, None] + (d - 448)[None, :],
++        mask=valid[:, None] & ~is_nope[None, :],
++        other=0.0,
++    )
++    k = tl.where(is_nope[None, :], nope, rope.to(tl.float32))
++    return k.to(tl.bfloat16), valid
++
++
++@triton.jit
++def _small_head_sparse_decode_kernel(
++    q_ptr,
++    q_stride_t,
++    q_stride_h,
++    swa_cache_ptr,
++    swa_page_stride,
++    swa_page_size,
++    swa_indices_ptr,
++    swa_indices_stride,
++    swa_lens_ptr,
++    extra_cache_ptr,
++    extra_page_stride,
++    extra_page_size,
++    extra_indices_ptr,
++    extra_indices_stride,
++    extra_lens_ptr,
++    part_o_ptr,
++    part_lse_ptr,
++    num_heads,
++    sm_scale,
++    HAS_EXTRA: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    NUM_SPLITS: tl.constexpr,
++):
++    tok = tl.program_id(0)
++    split = tl.program_id(1)
++
++    h = tl.arange(0, BLOCK_H)
++    d = tl.arange(0, 512)
++    q = tl.load(
++        q_ptr + tok.to(tl.int64) * q_stride_t + h[:, None] * q_stride_h + d[None, :],
++        mask=(h < num_heads)[:, None],
++        other=0.0,
++    )
++
++    qk_scale = sm_scale * 1.4426950408889634
++    m_i = tl.full([BLOCK_H], float("-inf"), dtype=tl.float32)
++    l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
++    acc = tl.zeros([BLOCK_H, 512], dtype=tl.float32)
++
++    swa_len = tl.load(swa_lens_ptr + tok)
++    swa_blocks = tl.cdiv(swa_len, BLOCK_N)
++    num_blocks = swa_blocks
++    extra_len = 0
++    if HAS_EXTRA:
++        extra_len = tl.load(extra_lens_ptr + tok)
++        num_blocks += tl.cdiv(extra_len, BLOCK_N)
++    blocks_per_split = tl.cdiv(num_blocks, NUM_SPLITS)
++    start_block = split * blocks_per_split
++    end_block = tl.minimum(start_block + blocks_per_split, num_blocks)
++
++    for blk in range(start_block, end_block):
++        if blk < swa_blocks:
++            k, valid = _load_kv_block(
++                swa_cache_ptr,
++                swa_page_stride,
++                swa_page_size,
++                swa_indices_ptr,
++                tok.to(tl.int64) * swa_indices_stride,
++                swa_len,
++                blk * BLOCK_N,
++                BLOCK_N,
++            )
++        else:
++            k, valid = _load_kv_block(
++                extra_cache_ptr,
++                extra_page_stride,
++                extra_page_size,
++                extra_indices_ptr,
++                tok.to(tl.int64) * extra_indices_stride,
++                extra_len,
++                (blk - swa_blocks) * BLOCK_N,
++                BLOCK_N,
++            )
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        s = tl.where(valid[None, :], s, float("-inf"))
++
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
++        alpha = tl.exp2(m_i - m_safe)
++        p = tl.exp2(s - m_safe[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), k)
++        m_i = m_new
++
++    empty = l_i == 0.0
++    # log2-domain LSE; -inf marks a split that saw no valid key.
++    lse = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
++    acc = acc * tl.where(empty, 0.0, 1.0 / l_i)[:, None]
++
++    part = (tok.to(tl.int64) * NUM_SPLITS + split) * BLOCK_H
++    tl.store(part_o_ptr + (part + h[:, None]) * 512 + d[None, :], acc)
++    tl.store(part_lse_ptr + part + h, lse)
++
++
++@triton.jit
++def _merge_splits_kernel(
++    part_o_ptr,
++    part_lse_ptr,
++    sink_ptr,
++    out_ptr,
++    out_stride_t,
++    out_stride_h,
++    BLOCK_H: tl.constexpr,
++    NUM_SPLITS: tl.constexpr,
++):
++    tok = tl.program_id(0)
++    head = tl.program_id(1)
++    d = tl.arange(0, 512)
++    s = tl.arange(0, NUM_SPLITS)
++    part = (tok.to(tl.int64) * NUM_SPLITS + s) * BLOCK_H + head
++    lse = tl.load(part_lse_ptr + part)
++    m = tl.max(lse, 0)
++    m_safe = tl.where(m == float("-inf"), 0.0, m)
++    w = tl.exp2(lse - m_safe)
++    denom = tl.sum(w, 0)
++    has_keys = denom > 0.0
++    safe_denom = tl.where(has_keys, denom, 1.0)
++    o = tl.sum(tl.load(part_o_ptr + part[:, None] * 512 + d[None, :]) * w[:, None], 0)
++
++    total_lse2 = m_safe + tl.log2(safe_denom)
++    sink2 = tl.load(sink_ptr + head) * 1.4426950408889634
++    # exp(lse) / (exp(lse) + exp(sink)), evaluated in log2 space.
++    o = o / safe_denom / (1.0 + tl.exp2(sink2 - total_lse2))
++    o = tl.where(has_keys, o, 0.0)
++    tl.store(
++        out_ptr + tok.to(tl.int64) * out_stride_t + head * out_stride_h + d,
++        o.to(out_ptr.dtype.element_ty),
++    )
++
++
++# Tuned on H20. Beyond these token counts FlashMLA is as fast or faster.
++_SHORT_KEYS = 256
++_SHORT_KEYS_MAX_TOKENS = 16
++_LONG_KEYS_MAX_TOKENS = 12
++
++
++def _max_supported_tokens(max_keys: int) -> int:
++    return _SHORT_KEYS_MAX_TOKENS if max_keys <= _SHORT_KEYS else _LONG_KEYS_MAX_TOKENS
++
++
++def small_head_decode_supported(num_tokens: int, max_keys: int) -> bool:
++    return num_tokens <= _max_supported_tokens(max_keys)
++
++
++def _pick_config(num_tokens: int, max_keys: int) -> tuple[int, int, int, int]:
++    if max_keys > _SHORT_KEYS:
++        if num_tokens <= 3:
++            return 32, 32, 4, 2
++        if num_tokens <= 7:
++            return 16, 32, 8, 2
++    return 8, 32, 8, 2
++
++
++_HEAD_BLOCK = 16
++_PADDED_HEADS = 64
++_PAGE_ALIGNMENT = 576
++# Every ``num_splits`` ``_pick_config`` can return.
++_SPLIT_CHOICES = (8, 16, 32)
++
++
++def _page_stride(page_size: int) -> int:
++    return (page_size * 584 + _PAGE_ALIGNMENT - 1) // _PAGE_ALIGNMENT * _PAGE_ALIGNMENT
++
++
++def _decode_warmup_inputs(
++    *,
++    num_heads: int,
++    has_extra: bool,
++    swa_width: int,
++    topk: int,
++    swa_page_size: int,
++    extra_page_size: int,
++):
++    int32 = TritonWarmupTensor(torch.int32)
++    swa_cache = TritonWarmupTensor(
++        torch.uint8,
++        shape=(1, swa_page_size, 584),
++        strides=(_page_stride(swa_page_size), 584, 1),
++    )
++    swa_indices = TritonWarmupTensor(torch.int32, shape=(1, swa_width))
++    extra_cache = (
++        TritonWarmupTensor(
++            torch.uint8,
++            shape=(1, extra_page_size, 584),
++            strides=(_page_stride(extra_page_size), 584, 1),
++        )
++        if has_extra
++        else swa_cache
++    )
++    extra_indices = (
++        TritonWarmupTensor(torch.int32, shape=(1, topk)) if has_extra else swa_indices
++    )
++    return dict(
++        q=TritonWarmupTensor(torch.bfloat16, shape=(1, _PADDED_HEADS, 512)),
++        swa_cache=swa_cache,
++        swa_indices=swa_indices,
++        swa_lens=int32,
++        extra_cache=extra_cache,
++        extra_indices=extra_indices,
++        extra_lens=int32,
++        part_o=TritonWarmupTensor(torch.float32),
++        part_lse=TritonWarmupTensor(torch.float32),
++        num_heads=num_heads,
++        sm_scale=1.0,
++        has_extra=has_extra,
++        num_tokens=WarmupIntRange(
++            1, _max_supported_tokens(swa_width + topk * has_extra) + 1
++        ),
++        max_keys=swa_width + topk * has_extra,
++    )
++
++
++@triton_kernel_dispatcher_with_warmup(
++    kernel=_small_head_sparse_decode_kernel,
++    warmup_inputs=_decode_warmup_inputs,
++)
++def _launch_partial_decode(
++    q: torch.Tensor,
++    swa_cache: torch.Tensor,
++    swa_indices: torch.Tensor,
++    swa_lens: torch.Tensor,
++    extra_cache: torch.Tensor,
++    extra_indices: torch.Tensor,
++    extra_lens: torch.Tensor,
++    part_o: torch.Tensor,
++    part_lse: torch.Tensor,
++    num_heads: int,
++    sm_scale: float,
++    has_extra: bool,
++    num_tokens: int,
++    max_keys: int,
++) -> DispatchSpec:
++    num_splits, block_n, num_warps, num_stages = _pick_config(num_tokens, max_keys)
++    return (num_tokens, num_splits), dict(
++        q_stride_t=q.stride(0),
++        q_stride_h=q.stride(1),
++        swa_page_stride=swa_cache.stride(0),
++        swa_page_size=swa_cache.shape[1],
++        swa_indices_stride=swa_indices.stride(0),
++        extra_page_stride=extra_cache.stride(0),
++        extra_page_size=extra_cache.shape[1],
++        extra_indices_stride=extra_indices.stride(0),
++        HAS_EXTRA=has_extra,
++        BLOCK_H=_HEAD_BLOCK,
++        BLOCK_N=block_n,
++        NUM_SPLITS=num_splits,
++        num_warps=num_warps,
++        num_stages=num_stages,
++    )
++
++
++def _merge_warmup_inputs():
++    return dict(
++        part_o=TritonWarmupTensor(torch.float32),
++        part_lse=TritonWarmupTensor(torch.float32),
++        sink=TritonWarmupTensor(torch.float32),
++        out=TritonWarmupTensor(torch.bfloat16, shape=(1, _PADDED_HEADS, 512)),
++        num_tokens=1,
++        num_heads=1,
++        num_splits=WarmupChoices(*_SPLIT_CHOICES),
++    )
++
++
++@triton_kernel_dispatcher_with_warmup(
++    kernel=_merge_splits_kernel,
++    warmup_inputs=_merge_warmup_inputs,
++)
++def _launch_merge_splits(
++    part_o: torch.Tensor,
++    part_lse: torch.Tensor,
++    sink: torch.Tensor,
++    out: torch.Tensor,
++    num_tokens: int,
++    num_heads: int,
++    num_splits: int,
++) -> DispatchSpec:
++    return (num_tokens, num_heads), dict(
++        out_stride_t=out.stride(0),
++        out_stride_h=out.stride(1),
++        BLOCK_H=_HEAD_BLOCK,
++        NUM_SPLITS=num_splits,
++        num_warps=4,
++    )
++
++
++def register_small_head_decode_warmup(
++    *,
++    num_heads: int,
++    has_extra: bool,
++    swa_widths: tuple[int, ...],
++    topk: int,
++    swa_page_size: int,
++    extra_page_size: int,
++) -> None:
++    """Compile every kernel variant ``small_head_sparse_decode`` can dispatch."""
++    for swa_width in swa_widths:
++        _launch_partial_decode.register_warmup(
++            num_heads=num_heads,
++            has_extra=has_extra,
++            swa_width=swa_width,
++            topk=topk,
++            swa_page_size=swa_page_size,
++            extra_page_size=extra_page_size,
++        )
++    _launch_merge_splits.register_warmup()
++
++
++def small_head_sparse_decode(
++    q: torch.Tensor,
++    swa_cache: torch.Tensor,
++    swa_indices: torch.Tensor,
++    swa_lens: torch.Tensor,
++    extra_cache: torch.Tensor | None,
++    extra_indices: torch.Tensor | None,
++    extra_lens: torch.Tensor | None,
++    attn_sink: torch.Tensor,
++    sm_scale: float,
++    out: torch.Tensor,
++    num_heads: int,
++) -> None:
++    """Sparse MLA decode over SWA keys plus optional compressed (extra) keys.
++
++    Args:
++        q: ``[T, H_pad, 512]`` bf16; only the first ``num_heads`` heads are read.
++        swa_cache: ``fp8_ds_mla`` paged SWA cache, ``[pages, page, 584]``.
++        swa_indices: ``[>=T, (1,) width]`` int32 global slot IDs; -1 is ignored.
++        swa_lens: ``[>=T]`` int32 valid SWA lengths.
++        extra_cache: Optional compressed cache with the same packed layout.
++        extra_indices: Optional compressed-cache global slot IDs.
++        extra_lens: Optional valid compressed-cache lengths.
++        attn_sink: ``[H_pad]`` fp32 per-head sink logits.
++        sm_scale: Softmax scale.
++        out: ``[T, H_pad, 512]``; the first ``num_heads`` heads are written.
++        num_heads: real (unpadded) heads on this rank, at most 16.
++
++    """
++    assert num_heads in (8, 16)
++    assert q.dtype == out.dtype == torch.bfloat16
++    assert q.shape[-1] == out.shape[-1] == 512
++    assert q.stride(-1) == out.stride(-1) == 1
++    assert swa_cache.shape[-1] == 584
++    assert extra_cache is None or extra_cache.shape[-1] == 584
++    num_tokens = q.shape[0]
++    if num_tokens == 0:
++        return
++    max_keys = swa_indices.shape[-1]
++    if extra_indices is not None:
++        max_keys += extra_indices.shape[-1]
++    num_splits = _pick_config(num_tokens, max_keys)[0]
++    part_o = torch.empty(
++        (num_tokens, num_splits, _HEAD_BLOCK, 512),
++        dtype=torch.float32,
++        device=q.device,
++    )
++    part_lse = torch.empty(
++        (num_tokens, num_splits, _HEAD_BLOCK), dtype=torch.float32, device=q.device
++    )
++    has_extra = extra_cache is not None
++    if not has_extra:
++        extra_cache, extra_indices, extra_lens = swa_cache, swa_indices, swa_lens
++    assert extra_cache is not None
++    assert extra_indices is not None and extra_lens is not None
++
++    # Metadata buffers are sized for max_num_batched_tokens; keep our rows.
++    swa_indices = swa_indices[:num_tokens].reshape(num_tokens, -1)
++    extra_indices = extra_indices[:num_tokens].reshape(num_tokens, -1)
++    # Byte-addressed: scales must be read as raw bytes, not fp8 values.
++    swa_cache = swa_cache.view(torch.uint8)
++    extra_cache = extra_cache.view(torch.uint8)
++    _launch_partial_decode(
++        q,
++        swa_cache,
++        swa_indices,
++        swa_lens,
++        extra_cache,
++        extra_indices,
++        extra_lens,
++        part_o,
++        part_lse,
++        num_heads,
++        sm_scale,
++        has_extra,
++        num_tokens,
++        max_keys,
++    )
++    _launch_merge_splits(
++        part_o, part_lse, attn_sink, out, num_tokens, num_heads, num_splits
++    )
+--- a/vllm/models/deepseek_v41/nvidia/specialized_decode/__init__.py
++++ b/vllm/models/deepseek_v41/nvidia/specialized_decode/__init__.py
+@@ -123,6 +123,23 @@
+     }
+ 
+ 
++def _adaptive_threshold_fits(num_speculative_tokens: int) -> bool:
++    """Whether hybrid adaptive verification leaves the executor its steps: with
++    VLLM_DSPARK_ADAPTIVE_MIN_REQS set to at most the requests of the largest
++    executor step (``max_rows()`` rows of ``1 + num_speculative_tokens`` per
++    request: 192 / 6 = 32 on Hopper), steps of up to that many requests verify
++    every draft, on uniform FULL decode graphs the executor captures, and larger
++    ones verify adaptively on varlen graphs that run the stock layers."""
++    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
++        adaptive_min_reqs,
++    )
++
++    threshold = adaptive_min_reqs()
++    return threshold is not None and threshold <= max_rows() // (
++        1 + num_speculative_tokens
++    )
++
++
+ def unsupported(vllm_config: VllmConfig) -> list[str]:
+     """Every requirement of the specialized decode this deployment misses."""
+     parallel = vllm_config.parallel_config
+@@ -145,10 +162,15 @@
+             and parallel.prefill_context_parallel_size == 1
+             and not parallel.use_ubatching
+         ),
+-        "DSpark speculative decoding without adaptive verification": (
++        "DSpark speculative decoding without adaptive verification, or with "
++        "adaptive verification limited (VLLM_DSPARK_ADAPTIVE_MIN_REQS) to steps "
++        "above at most the executor's largest step in requests": (
+             spec is not None
+             and spec.method == "dspark"
+-            and not spec.enable_adaptive_verification
++            and (
++                not spec.enable_adaptive_verification
++                or _adaptive_threshold_fits(spec.num_speculative_tokens)
++            )
+         ),
+         **_attention_requirement(vllm_config),
+         "FULL CUDA graphs for decode batches only (FULL_AND_PIECEWISE or "
+@@ -168,7 +190,8 @@
+             and vllm_config.kv_transfer_config is None
+             and not envs.VLLM_BATCH_INVARIANT
+         ),
+-        "DeepGEMM and NVLink multicast for the fused all-reduce + mHC": (
++        "DeepGEMM and NVLink multicast (or, on SM90, NVLink P2P to every TP "
++        "peer) for the fused all-reduce + mHC": (
+             supports_mhc_overlap(vllm_config) and supports_mhc_all_reduce(vllm_config)
+         ),
+     }
+@@ -195,7 +218,7 @@
+         return None
+     missing = unsupported(vllm_config)
+     supported = torch.tensor([0 if missing else 1], dtype=torch.int32)
+-    # The NVLink multicast check is rank-local (the custom all-reduce catches a
++    # The NVLink multicast / P2P check is rank-local (the custom all-reduce catches a
+     # failed setup on each rank), and ranks that disagree would hang.
+     dist.all_reduce(supported, op=dist.ReduceOp.MIN, group=get_tp_group().cpu_group)
+     if not supported.item():
+--- a/vllm/models/deepseek_v41/nvidia/specialized_decode/boundary/all_reduce.py
++++ b/vllm/models/deepseek_v41/nvidia/specialized_decode/boundary/all_reduce.py
+@@ -44,11 +44,13 @@
+         self._published: torch.Tensor | None = None
+ 
+     def publish_target(self) -> tuple[int, int]:
+-        """(multicast mailbox address, stage-state address) for a producer
++        """(mailbox store address, stage-state address) for a producer
+         that stores its contribution itself, as ``_SharedOnlyPublishDeviceKernel``
+         does: generation ``stage_state[0]``, slot ``[rank][token]``, BF16 with
+         negative zero cleared, then ``stage_state[1] = stage_state[0]``. Both
+-        stay valid for this instance's lifetime."""
++        stay valid for this instance's lifetime. The store address is the
++        multicast mapping, or with ``self.p2p`` (no multicast) the device
++        address of the int64 table of the ``p2p`` ranks' mailbox bases."""
+         return self._multicast, self._stage_state.data_ptr()
+ 
+     def mark_published(self, x: torch.Tensor) -> None:
+--- a/vllm/models/deepseek_v41/nvidia/specialized_decode/boundary/publishing_gemm.py
++++ b/vllm/models/deepseek_v41/nvidia/specialized_decode/boundary/publishing_gemm.py
+@@ -113,6 +113,7 @@
+     sanitize_negative_zero_u32x4,
+     shuffle_sync_idx_u32,
+     stmc_bf16x8,
++    stp2p_bf16x8,
+ )
+ from .. import LOW_BATCH_MAX_ROWS
+ from ..attention.mxfp8 import Tactic, mxfp8_eligible
+@@ -163,6 +164,7 @@
+         rank: int,
+         capacity_m: int,
+         hidden: int,
++        p2p: int = 0,
+         **kwargs,
+     ) -> None:
+         super().__init__(**kwargs)
+@@ -177,6 +179,8 @@
+         self.rank = rank
+         self.capacity_m = capacity_m
+         self.hidden = hidden
++        # Nonzero: ``mailbox_multicast`` is a [p2p] table of peer bases.
++        self.p2p = p2p
+ 
+     @cute.jit
+     def publish_value(
+@@ -214,7 +218,15 @@
+                     (Int64(stage) * self.tp + self.rank) * self.capacity_m
+                     + Int64(token)
+                 ) * self.hidden + Int64(column)
+-                stmc_bf16x8(Int64(self.mailbox_multicast) + element * 2, clean)
++                if cutlass.const_expr(self.p2p):
++                    stp2p_bf16x8(
++                        Int64(self.mailbox_multicast),
++                        element * Int64(2),
++                        clean,
++                        self.p2p,
++                    )
++                else:
++                    stmc_bf16x8(Int64(self.mailbox_multicast) + element * 2, clean)
+ 
+     @cute.jit
+     def epilog_warp(
+@@ -545,6 +557,7 @@
+             rank=all_reduce.rank,
+             capacity_m=all_reduce.capacity,
+             hidden=all_reduce.hidden_size,
++            p2p=all_reduce.p2p,
+             acc_dtype=cutlass.Float32,
+             mma_tiler_mnk=(128, 8, cta_k),
+             num_ab_stage=ab_stages,
+--- a/vllm/models/deepseek_v41/nvidia/specialized_decode/hopper/dense.py
++++ b/vllm/models/deepseek_v41/nvidia/specialized_decode/hopper/dense.py
+@@ -25,6 +25,7 @@
+ and its scales in the Humming layout, a second copy of the weight.
+ """
+ 
++import os
+ from functools import cache
+ from typing import NamedTuple
+ 
+@@ -33,6 +34,8 @@
+ 
+ from vllm.logger import init_logger
+ 
++_DENSE_BF16 = os.environ.get("DSV41_SD_DENSE_BF16", "0") == "1"
++
+ logger = init_logger(__name__)
+ 
+ # Rows of the largest call a seam takes.
+@@ -252,8 +255,18 @@
+     return smem <= 227 * 1024 - 2048
+ 
+ 
++def _p2p(publish: bool) -> int:
++    """The mailbox store mode publishing kernels compile for (0: multicast),
++    as the process's ``AllReduceMHC`` mailboxes chose it."""
++    if not publish:
++        return 0
++    from ...ops.cute_dsl.all_reduce_mhc import publish_p2p_ranks
++
++    return publish_p2p_ranks()
++
++
+ @cache
+-def _compiled(nt: int, c: Cute, xr: int, pub: bool):
++def _compiled(nt: int, c: Cute, xr: int, pub: bool, p2p: int = 0):
+     import cutlass
+     import cutlass.cute as cute
+ 
+@@ -266,7 +279,8 @@
+         )
+ 
+     kernel = DenseFp8Gemm(
+-        nt, c.tw, c.S, c.NS, c.wm, c.kg, c.sk, xr, c.prec, int(pub), c.cn
++        nt, c.tw, c.S, c.NS, c.wm, c.kg, c.sk, xr, c.prec, int(pub), c.cn,
++        p2p if pub else 0,
+     )
+     tensors = [
+         fake(cutlass.BFloat16),
+@@ -339,6 +353,10 @@
+     def _choice(self, rows: int) -> Cute | dict | None:
+         c = choice(self.seam, rows)
+         if isinstance(c, Cute):
++            # DSV41_SD_DENSE_BF16=1 runs every CuTe geometry with BF16
++            # operands (prec 1, exact), never the f16 pre-scaled activations.
++            if _DENSE_BF16 and c.prec == 0:
++                c = c._replace(prec=1)
+             return c if cute_fits(c, rows, self.n, self.k) else None
+         return c if self.humming is not None else None
+ 
+@@ -372,7 +390,9 @@
+         a ``rows``-row call, before CUDA graph capture."""
+         c = self._choice(rows)
+         if isinstance(c, Cute):
+-            _compiled((rows + 7) // 8, c, _staged_rows(self.k, c.sk), publish)
++            _compiled(
++                (rows + 7) // 8, c, _staged_rows(self.k, c.sk), publish, _p2p(publish)
++            )
+         elif c is not None:
+             x = torch.zeros(
+                 rows, self.k, dtype=torch.bfloat16, device=self.weight.device
+@@ -414,7 +434,11 @@
+             group_stride = self.k if self.n_group else 0
+             span = x.shape[1]
+         fn = _compiled(
+-            (rows + 7) // 8, c, _staged_rows(self.k, c.sk), all_reduce is not None
++            (rows + 7) // 8,
++            c,
++            _staged_rows(self.k, c.sk),
++            all_reduce is not None,
++            all_reduce.p2p if all_reduce is not None else 0,
+         )
+         mc = sst = rank_cap = tp_cap = 0
+         if all_reduce is not None:
+--- a/vllm/models/deepseek_v41/nvidia/specialized_decode/hopper/dense_gemm_cute.py
++++ b/vllm/models/deepseek_v41/nvidia/specialized_decode/hopper/dense_gemm_cute.py
+@@ -84,6 +84,7 @@
+         prec: int,
+         pub: int,
+         cn: int = 1,
++        p2p: int = 0,
+     ):
+         assert (4 * tw) % wm == 0 and S % (2 * kg) == 0
+         self.nt, self.mpad, self.tw, self.S, self.NS = nt, 8 * nt, tw, S, NS
+@@ -92,6 +93,8 @@
+         self.nthreads = (self.cw + DMA_WARPS) * 32
+         assert (S * tw * 64) % (DMA_WARPS * 32) == 0
+         self.prec, self.pub = prec, pub
++        # Nonzero (with pub): ``mc`` is a [p2p] table of peer mailbox bases.
++        self.p2p = p2p
+         assert sk * cn <= 8
+         self.cn = cn
+         self.w_bytes = S * tw * 1024
+@@ -325,10 +328,22 @@
+         hi = pack_bf16x2(v2, v3)
+         stg_b32x2(yg + Int64(tok * ldy + col) * 2, lo, hi)
+         if const_expr(self.pub == 1):
+-            slot = Int64(stage * tp_cap + rank_cap + tok) * Int64(N) + Int64(col)
+-            stmc_b32x2(
+-                mc + slot * 2, clear_negzero_bf16x2(lo), clear_negzero_bf16x2(hi)
+-            )
++            if const_expr(self.p2p):
++                slot = (
++                    Int64(stage) * Int64(tp_cap) + Int64(rank_cap) + Int64(tok)
++                ) * Int64(N) + Int64(col)
++                stp2p_b32x2(
++                    mc,
++                    slot * Int64(2),
++                    clear_negzero_bf16x2(lo),
++                    clear_negzero_bf16x2(hi),
++                    self.p2p,
++                )
++            else:
++                slot = Int64(stage * tp_cap + rank_cap + tok) * Int64(N) + Int64(col)
++                stmc_b32x2(
++                    mc + slot * 2, clear_negzero_bf16x2(lo), clear_negzero_bf16x2(hi)
++                )
+ 
+     @cute.jit
+     def release_stage(self, cta, tidx, sst, stage):
+@@ -1024,6 +1039,22 @@
+     )
+ 
+ 
++def stp2p_b32x2(peers: Int64, offset: Int64, a, b, tp: int):
++    """``stmc_b32x2`` without multicast: one ``st.relaxed.sys`` of the 4 BF16
++    values into each rank's mailbox copy, at ``offset`` past the bases in the
++    int64 table ``peers`` (u64 arithmetic only)."""
++    stores = "".join(
++        f"ld.global.u64 p2p_base, [{{$r0}}+{8 * peer}];\n"
++        "add.u64 p2p_base, p2p_base, {$r1};\n"
++        "st.relaxed.sys.global.v2.b32 [p2p_base], {{$r2}, {$r3}};\n"
++        for peer in range(tp)
++    )
++    inline_ptx(
++        "{ .reg .u64 p2p_base;\n" + stores + "}",
++        read_only_args=[peers, offset, a, b],
++    )
++
++
+ def clear_negzero_bf16x2(w: Int32) -> Int32:
+     """BF16x2 with negative-zero halves (the Lamport sentinel) made +0."""
+     return inline_ptx(
+--- a/vllm/models/deepseek_v41/nvidia/specialized_decode/runtime/decode.py
++++ b/vllm/models/deepseek_v41/nvidia/specialized_decode/runtime/decode.py
+@@ -307,8 +307,8 @@
+         intermediate_tensors: IntermediateTensors | None,
+     ) -> DecodeStep | None:
+         """The step this forward runs, or None to run the stock layers: only
+-        FULL CUDA graph captures of pure decode steps of up to ``max_rows``
+-        rows run the executor."""
++        FULL CUDA graph captures of pure uniform decode steps of up to
++        ``max_rows`` rows run the executor (not varlen decode graphs)."""
+         rows = positions.shape[0]
+         if (
+             intermediate_tensors is not None
+@@ -323,6 +323,13 @@
+             return None
+         if not captures_pure_decode(self._swa_prefixes):
+             return None
++        from vllm.v1.worker.gpu.cudagraph_utils import is_capturing_varlen_decode
++
++        if is_capturing_varlen_decode():
++            # Hybrid adaptive verification: varlen decode graphs serve the adaptive
++            # steps above the threshold, whose query lengths the device decides;
++            # they stay on the stock layers, as without the executor.
++            return None
+         return self.gates(rows)
+ 
+     def run(
+--- a/vllm/models/deepseek_v41/nvidia/specialized_decode/runtime/metadata_graphs.py
++++ b/vllm/models/deepseek_v41/nvidia/specialized_decode/runtime/metadata_graphs.py
+@@ -101,7 +101,10 @@
+         ):
+             return None
+         query_lens = input_batch.num_scheduled_tokens[: input_batch.num_reqs]
+-        if not (query_lens == query_lens[0]).all():
++        # Recorded keys are decodes of decode_query_len rows per request; other
++        # uniform steps (e.g. one token per request on a varlen decode graph of
++        # hybrid adaptive verification) have no recording.
++        if not (query_lens == self._decode_query_len).all():
+             return None
+         return (
+             input_batch.num_reqs,
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -61,6 +61,29 @@
+ 
+ logger = init_logger(__name__)
+ 
++# True while a FULL varlen decode graph (adaptive verification: per-request query
++# lengths decided on device) is warmed up or captured. Decode executors that
++# assume host-known uniform query lengths read it to keep such graphs on the
++# stock path.
++_capturing_varlen_decode = False
++
++
++def is_capturing_varlen_decode() -> bool:
++    """Whether the forward being run is the warmup or capture of a FULL varlen
++    decode graph."""
++    return _capturing_varlen_decode
++
++
++def is_varlen_decode_desc(desc: "BatchExecutionDescriptor") -> bool:
++    """Whether ``desc`` is a FULL varlen decode graph: no uniform token count, a
++    query length bound and request padding."""
++    return (
++        desc.cg_mode == CUDAGraphMode.FULL
++        and desc.uniform_token_count is None
++        and desc.max_query_len is not None
++        and desc.num_reqs is not None
++    )
++
+ 
+ class AttentionState(NamedTuple):
+     attn_metadata: dict[str, Any] | None
+@@ -157,6 +180,7 @@
+         lora_capture_cases: list[int] | None = None,
+         varlen_decode: bool = False,
+         ubatch_runner: "UBatchRunner | None" = None,
++        uniform_decode_max_reqs: int | None = None,
+     ):
+         self.vllm_config = vllm_config
+         self.device = device
+@@ -166,6 +190,12 @@
+         self.cudagraph_mode = cudagraph_mode
+         self.decode_query_len = decode_query_len
+         self.varlen_decode = varlen_decode
++        # Hybrid adaptive verification (VLLM_DSPARK_ADAPTIVE_MIN_REQS): besides the
++        # varlen decode graphs, capture uniform decode graphs for steps of up to
++        # this many requests, which verify every draft. None: one decode route.
++        self.uniform_decode_max_reqs = (
++            uniform_decode_max_reqs if varlen_decode else None
++        )
+         # DBO supports FULL CUDA graphs only.
+         self.ubatch_runner = ubatch_runner
+ 
+@@ -302,6 +332,23 @@
+         capture_varlen_decode = (
+             separate_decode_routine and bool(decode_mode) and self.varlen_decode
+         )
++        # Hybrid adaptive verification also captures the uniform decode graphs,
++        # up to the threshold's request count (plus the smallest graph above it,
++        # so every step at or below the threshold has one).
++        hybrid = capture_varlen_decode and self.uniform_decode_max_reqs is not None
++        capture_uniform_decode = bool(
++            separate_decode_routine and decode_mode and (not self.varlen_decode or hybrid)
++        )
++        uniform_reqs_cap: int | None = None
++        if hybrid:
++            assert self.uniform_decode_max_reqs is not None
++            above = [
++                round_up(n, q) // q
++                for n in capture_sizes
++                for q in decode_query_lens
++                if round_up(n, q) // q >= self.uniform_decode_max_reqs
++            ]
++            uniform_reqs_cap = min(above, default=self.uniform_decode_max_reqs)
+         for num_tokens, num_active_loras in product(
+             capture_sizes, self.lora_capture_cases
+         ):
+@@ -318,7 +365,9 @@
+                 descs_by_mode[decode_mode].append(desc)
+             # Capture uniform decode specfifc graphs if required
+             #  (i.e. separate decode routine)
+-            elif separate_decode_routine and decode_mode and not self.varlen_decode:
++            if capture_uniform_decode and (
++                hybrid or not (capture_varlen_decode and num_tokens <= max_decode_tokens)
++            ):
+                 for decode_query_len in decode_query_lens:
+                     rounded_num_tokens = round_up(num_tokens, decode_query_len)
+                     rounded_num_reqs = rounded_num_tokens // decode_query_len
+@@ -327,6 +376,10 @@
+                         rounded_num_tokens > max_decode_tokens
+                         or rounded_num_tokens > max_cg_capture_size
+                         or rounded_num_reqs > self.max_num_reqs
++                        or (
++                            uniform_reqs_cap is not None
++                            and rounded_num_reqs > uniform_reqs_cap
++                        )
+                     ):
+                         continue
+ 
+@@ -379,9 +432,21 @@
+ 
+         for mode in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE):
+             mode_descs = tuple(reversed(descs_by_mode.get(mode, [])))
+-            for num_active_loras in self.lora_capture_cases:
++            # Hybrid adaptive verification: the uniform decode graphs and the varlen
++            # ones are two routes, each its own size ladder. A uniform step tries the
++            # smallest uniform graph that holds it before any varlen graph, even a
++            # varlen graph with fewer tokens.
++            routes: list[tuple[BatchExecutionDescriptor, ...]] = [mode_descs]
++            if hybrid and mode == decode_mode:
++                routes = [
++                    tuple(d for d in mode_descs if d.uniform_token_count is not None),
++                    tuple(d for d in mode_descs if d.uniform_token_count is None),
++                ]
++            for route_descs, num_active_loras in product(
++                routes, self.lora_capture_cases
++            ):
+                 lora_descs = [
+-                    d for d in mode_descs if d.num_active_loras == num_active_loras
++                    d for d in route_descs if d.num_active_loras == num_active_loras
+                 ]
+                 current_range_start = 0
+                 # Dynamic speculative decoding can produce multiple graphs with the same
+@@ -514,10 +579,17 @@
+ 
+         self._graphs_captured = True
+ 
+-    def captured_token_counts(self) -> list[int]:
+-        """Sorted token counts with a captured graph, ignoring LoRA variants."""
++    def captured_token_counts(self, skip_uniform_decode: bool = False) -> list[int]:
++        """Sorted token counts with a captured graph, ignoring LoRA variants, and
++        with ``skip_uniform_decode`` the uniform decode graphs (which hybrid
++        adaptive verification captures beside the varlen ones)."""
+         return sorted(
+-            {desc.num_tokens for desc in self.graphs if desc.num_active_loras == 0}
++            {
++                desc.num_tokens
++                for desc in self.graphs
++                if desc.num_active_loras == 0
++                and not (skip_uniform_decode and desc.uniform_token_count is not None)
++            }
+         )
+ 
+     def dispatch(
+@@ -595,6 +667,7 @@
+         lora_capture_cases: list[int] | None = None,
+         varlen_decode: bool = False,
+         ubatch_runner: "UBatchRunner | None" = None,
++        uniform_decode_max_reqs: int | None = None,
+     ):
+         super().__init__(
+             vllm_config,
+@@ -604,6 +677,7 @@
+             lora_capture_cases=lora_capture_cases,
+             varlen_decode=varlen_decode,
+             ubatch_runner=ubatch_runner,
++            uniform_decode_max_reqs=uniform_decode_max_reqs,
+         )
+         self.hidden_states: torch.Tensor | None = None
+         self.aux_hidden_states: list[torch.Tensor] = []
+@@ -751,7 +825,10 @@
+             if pcp_manager is not None:
+                 is_padding = pcp_manager.moe_is_padding(is_padding)
+ 
++            varlen = is_varlen_decode_desc(desc)
++
+             def forward_fn(cg_mode: CUDAGraphMode) -> None:
++                global _capturing_varlen_decode
+                 batch_descriptor = None
+                 if cg_mode == CUDAGraphMode.PIECEWISE:
+                     batch_descriptor = BatchDescriptor(
+@@ -759,22 +836,26 @@
+                         has_lora=has_lora,
+                         num_active_loras=desc.num_active_loras,
+                     )
+-                with set_forward_context(
+-                    attn_metadata,
+-                    self.vllm_config,
+-                    num_tokens=num_tokens,
+-                    cudagraph_runtime_mode=cg_mode,
+-                    num_tokens_across_dp=num_tokens_across_dp,
+-                    slot_mapping=slot_mappings,
+-                    batch_descriptor=batch_descriptor,
+-                    is_padding=is_padding,
+-                ):
+-                    if cg_mode == CUDAGraphMode.PIECEWISE:
+-                        # PIECEWISE graph (compiled PW or breakable, chosen inside
+-                        # run_pw_graph).
+-                        model_output = self.run_pw_graph(model, model_inputs)
+-                    else:
+-                        model_output = model(**model_inputs)
++                _capturing_varlen_decode = varlen
++                try:
++                    with set_forward_context(
++                        attn_metadata,
++                        self.vllm_config,
++                        num_tokens=num_tokens,
++                        cudagraph_runtime_mode=cg_mode,
++                        num_tokens_across_dp=num_tokens_across_dp,
++                        slot_mapping=slot_mappings,
++                        batch_descriptor=batch_descriptor,
++                        is_padding=is_padding,
++                    ):
++                        if cg_mode == CUDAGraphMode.PIECEWISE:
++                            # PIECEWISE graph (compiled PW or breakable, chosen
++                            # inside run_pw_graph).
++                            model_output = self.run_pw_graph(model, model_inputs)
++                        else:
++                            model_output = model(**model_inputs)
++                finally:
++                    _capturing_varlen_decode = False
+ 
+                 if cg_mode == CUDAGraphMode.PIECEWISE:
+                     # PW CUDA graph (compiled or breakable) internally handles the
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -158,6 +158,8 @@
+ from vllm.v1.worker.gpu.spec_decode import init_speculator
+ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+     AdaptiveVerificationManager,
++    adaptive_min_reqs,
++    adaptive_step,
+     maybe_create_adaptive_verification_manager,
+     resolve_adaptive_cudagraph_mode,
+ )
+@@ -776,6 +778,11 @@
+             lora_capture_cases=self.lora_capture_cases,
+             varlen_decode=self.adaptive_verification is not None,
+             ubatch_runner=self.ubatch_runner,
++            # Hybrid adaptive verification: steps of up to this many requests
++            # verify every draft on uniform decode graphs.
++            uniform_decode_max_reqs=(
++                adaptive_min_reqs() if self.adaptive_verification is not None else None
++            ),
+         )
+         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
+             self.fast_prefill = FastPrefillHelper(
+@@ -1135,8 +1142,12 @@
+                             self.speculator.capture()
+                     if self.adaptive_verification is not None:
+                         with self.step_timing.collect() as timings:
++                            # Only the varlen graphs run adaptive steps; the uniform
++                            # decode graphs of hybrid adaptive verification do not.
+                             for batch in self.adaptive_verification.batches_to_profile(
+-                                self.cudagraph_manager.captured_token_counts()
++                                self.cudagraph_manager.captured_token_counts(
++                                    skip_uniform_decode=True
++                                )
+                             ):
+                                 self._dummy_run(**batch)
+                         self.adaptive_verification.set_initial_cost_curves(timings)
+@@ -1346,7 +1357,7 @@
+             num_draft_tokens_np = np.fromiter(
+                 num_drafts_iter, dtype=np.int32, count=num_reqs
+             )
+-            if self.adaptive_verification is not None:
++            if self._adaptive_verification_step(num_reqs):
+                 num_toks = self.adaptive_verification.get_num_tokens(
+                     num_tokens_per_req, draft_tokens
+                 )
+@@ -1379,9 +1390,27 @@
+             decode_graph_eligible=decode_graph_eligible,
+             max_seq_len_np=max_seq_len_np,
+         )
+-        return batch_state, get_uniform_decode_token_count(
++        uniform_tok_count = get_uniform_decode_token_count(
+             num_reqs, num_toks, max_query_len, decode_graph_eligible
+         )
++        if (
++            draft_tokens
++            and adaptive_min_reqs() is not None
++            and self._adaptive_verification_step(num_reqs)
++        ):
++            # Hybrid adaptive verification: an adaptive step's device split may
++            # differ from its host one, so it runs a varlen graph only, never a
++            # uniform decode graph (those serve the steps at or below the
++            # threshold).
++            uniform_tok_count = None
++        return batch_state, uniform_tok_count
++
++    def _adaptive_verification_step(self, num_reqs: int) -> bool:
++        """Whether a step of ``num_reqs`` requests verifies adaptively: always
++        with adaptive verification on, unless VLLM_DSPARK_ADAPTIVE_MIN_REQS
++        limits it to steps of more requests. The request count comes from the
++        scheduler output, which every TP rank holds identically."""
++        return self.adaptive_verification is not None and adaptive_step(num_reqs)
+ 
+     def prepare_inputs(
+         self,
+@@ -1440,7 +1469,11 @@
+ 
+         # The general branch also serves a no-draft batch with k != 1, and
+         # compact_batch's budget is only primed when drafts are scheduled.
+-        adaptive_verification = self.adaptive_verification if draft_tokens else None
++        adaptive_verification = (
++            self.adaptive_verification
++            if draft_tokens and self._adaptive_verification_step(num_reqs)
++            else None
++        )
+         num_scheduled_tokens_upper_bound = num_scheduled_tokens_np
+         num_admitted_draft_tokens = None
+         if adaptive_verification is not None:
+@@ -2323,9 +2356,14 @@
+                 draft_tokens[:, num_spec_tokens:] = -1
+             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+             if self.adaptive_verification is not None:
+-                self.adaptive_verification.record_confidences(
+-                    self.speculator.draft_token_confidence_probs, input_batch
+-                )
++                if getattr(self.speculator, "drafted_confidences", True):
++                    self.adaptive_verification.record_confidences(
++                        self.speculator.draft_token_confidence_probs, input_batch
++                    )
++                else:
++                    # Hybrid adaptive verification: a draft step at or below the
++                    # threshold took the fused sampler, which has no confidences.
++                    self.adaptive_verification.forget_confidences(input_batch)
+ 
+         if self.num_speculative_steps > 0:
+             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+--- a/vllm/v1/worker/gpu/post_forward_cudagraph.py
++++ b/vllm/v1/worker/gpu/post_forward_cudagraph.py
+@@ -163,6 +163,9 @@
+         """The runner's post-forward graphs for DSpark, when its model state
+         offers them (``post_forward_cudagraphs``), or None."""
+         from vllm.v1.worker.gpu.kv_connector import NO_OP_KV_CONNECTOR
++        from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
++            adaptive_min_reqs,
++        )
+         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
+             DSparkSpeculator,
+         )
+@@ -184,7 +187,11 @@
+             or runner.pcp_manager is not None
+             or runner.dcp_size > 1,
+             "batch-sharded sampling": runner.batch_sharder is not None,
+-            "adaptive verification": runner.adaptive_verification is not None,
++            # Hybrid adaptive verification (VLLM_DSPARK_ADAPTIVE_MIN_REQS) keeps
++            # the graphs for the steps at or below the threshold, which verify
++            # every draft; _step_eligible refuses the adaptive ones.
++            "adaptive verification": runner.adaptive_verification is not None
++            and adaptive_min_reqs() is None,
+             "LoRA": runner.lora_config is not None,
+             "a KV connector": runner.kv_connector is not NO_OP_KV_CONNECTOR,
+             "an aux output connector": runner.aux_output_connector is not None,
+@@ -250,6 +257,9 @@
+             or hidden_states.data_ptr() != static_hidden_states.data_ptr()
+             or num_reqs == 0
+             or input_batch.has_prefill
++            # An adaptive step (hybrid adaptive verification) splits its drafts on
++            # the device.
++            or input_batch.max_query_len is not None
+             or grammar_output is not None
+             or input_batch.has_structured_output_reqs
+             or input_batch.num_draft_tokens != num_reqs * num_steps
+@@ -299,6 +309,41 @@
+         temperature = self.temperature[:num_states]
+         seeds = self.seeds[:num_states]
+         prefill_len = self.prefill_len[:num_states]
++        drafter_hidden_states = get_drafter_hidden_states(runner.model, hidden_states)
++        # The step's own input_ids, positions, query_start_loc and seq_lens; the
++        # copies below replace only the index tensors.
++        key = (
++            num_reqs,
++            input_batch.num_tokens,
++            *(
++                _tensor_key(t)
++                for t in (
++                    hidden_states,
++                    drafter_hidden_states,
++                    *(aux_hidden_states or ()),
++                    input_batch.input_ids,
++                    input_batch.positions,
++                    input_batch.query_start_loc,
++                    input_batch.seq_lens,
++                    temperature,
++                    seeds,
++                    prefill_len,
++                )
++            ),
++        )
++        # Past the graph limit a new shape takes the runner's own eager region,
++        # not this one run eagerly on every step: at 64 requests that ran an
++        # out-of-range read (Xid 13, 11-01 10:42Z) after ~10 s of such steps.
++        if (
++            key not in self.graphs
++            and key not in self.warmed_up
++            and len(self.warmed_up) >= self.MAX_GRAPHS
++        ):
++            logger.warning_once(
++                "Over %d post-forward batch shapes; new ones take the eager region.",
++                self.MAX_GRAPHS,
++            )
++            return None
+         _copy_step_tensors_kernel[(8,)](
+             input_batch.idx_mapping,
+             self.idx_mapping,
+@@ -329,26 +374,6 @@
+             expanded_local_pos=self.expanded_local_pos[:num_logits],
+             logits_indices=self.logits_indices[:num_logits],
+         )
+-        drafter_hidden_states = get_drafter_hidden_states(runner.model, hidden_states)
+-        key = (
+-            num_reqs,
+-            input_batch.num_tokens,
+-            *(
+-                _tensor_key(t)
+-                for t in (
+-                    hidden_states,
+-                    drafter_hidden_states,
+-                    *(aux_hidden_states or ()),
+-                    batch.input_ids,
+-                    batch.positions,
+-                    batch.query_start_loc,
+-                    batch.seq_lens,
+-                    temperature,
+-                    seeds,
+-                    prefill_len,
+-                )
+-            ),
+-        )
+ 
+         def post_forward() -> PostForwardOutput:
+             logits = runner.model.compute_logits(hidden_states[batch.logits_indices])
+@@ -400,13 +425,8 @@
+         entry = self.graphs.get(key)
+         if entry is None:
+             if key not in self.warmed_up:
+-                if len(self.warmed_up) < self.MAX_GRAPHS:
+-                    self.warmed_up.add(key)
+-                else:
+-                    logger.warning_once(
+-                        "Over %d post-forward batch shapes; new ones run eagerly.",
+-                        self.MAX_GRAPHS,
+-                    )
++                # run() refuses new keys past MAX_GRAPHS.
++                self.warmed_up.add(key)
+                 return fn()
+             if self.pool is None:
+                 self.pool = current_platform.graph_pool_handle()
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -4,6 +4,7 @@
+ 
+ from collections import defaultdict
+ from collections.abc import Iterable, Iterator
++from functools import cache
+ from typing import TYPE_CHECKING
+ 
+ import numpy as np
+@@ -33,6 +34,27 @@
+     from vllm.v1.worker.utils import AttentionGroup
+ 
+ 
++@cache
++def adaptive_min_reqs() -> int | None:
++    """VLLM_DSPARK_ADAPTIVE_MIN_REQS: with adaptive verification on, only steps of
++    more than this many requests verify adaptively; the others verify every
++    draft, as with adaptive verification off. None (unset): every step."""
++    value = envs.VLLM_DSPARK_ADAPTIVE_MIN_REQS
++    if value is not None and value < 0:
++        raise ValueError(
++            f"VLLM_DSPARK_ADAPTIVE_MIN_REQS must be >= 0, got {value}"
++        )
++    return value
++
++
++def adaptive_step(num_reqs: int) -> bool:
++    """Whether a step of ``num_reqs`` requests verifies adaptively (when adaptive
++    verification is on). A function of the step's request count only, which every
++    tensor-parallel rank holds identically."""
++    threshold = adaptive_min_reqs()
++    return threshold is None or num_reqs > threshold
++
++
+ def resolve_adaptive_cudagraph_mode(
+     mode: CUDAGraphMode, *, piecewise_capture_available: bool
+ ) -> CUDAGraphMode:
+@@ -302,6 +324,27 @@
+             write_slot.copy_to_cpu()
+             self._copy_events[write_idx].record()
+ 
++    def forget_confidences(self, input_batch: "InputBatch") -> None:
++        """This step's drafts carry no confidences (hybrid adaptive verification:
++        the draft step, at or below the threshold, took the fused sampler). Reset
++        the batch's requests to confidence 1.0, as ``add_request`` does, so a later
++        adaptive step does not rank these drafts by an older draft's confidences.
++        """
++        num_reqs = input_batch.num_reqs
++        if num_reqs == 0:
++            return
++        # The slot not being read may still be receiving a copy of the device
++        # confidences; wait for it so it cannot overwrite the reset rows.
++        with gpu_sync_allowed():
++            self._copy_events[self._stale_idx ^ 1].synchronize()
++        slots = input_batch.idx_mapping_np[:num_reqs]
++        for stale in self._stale_confidences:
++            stale.np[slots] = 1.0
++        # index_fill_ takes the scalar as an argument; assigning 1.0 through an
++        # index copies it from pageable host memory and blocks the host for the
++        # whole step on every hybrid step at or below the threshold.
++        self._confidence_probs.index_fill_(0, input_batch.idx_mapping[:num_reqs], 1.0)
++
+     def get_num_tokens(
+         self,
+         num_tokens_per_req: dict[str, int],
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -34,6 +34,10 @@
+ from vllm.platforms import current_platform
+ from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
++from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
++    adaptive_min_reqs,
++    adaptive_step,
++)
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+ from vllm.v1.worker.gpu.spec_decode.dspark.fused_sample import (
+     DSparkFusedMarkovSampler,
+@@ -99,6 +103,9 @@
+         # Whether the sharded chain takes the draft LM head's local vocabulary
+         # shard, without the all-gather.
+         self._draft_local_logits = False
++        # Whether the last propose() left this batch's confidences in
++        # draft_token_confidence_probs (read by the runner after propose).
++        self.drafted_confidences = True
+ 
+     def load_draft_model(
+         self,
+@@ -143,7 +150,7 @@
+             and self.draft_logits.shape[-1] == draft_vocab_size
+             and self._draft_topk is None
+             and self.draft_watermarker is None
+-            and not self.enable_adaptive_verification
++            and (not self.enable_adaptive_verification or self._hybrid_adaptive)
+             and (embed_weight := get_embed_weight()) is not None
+         ):
+             self._fused_sampler = DSparkFusedMarkovSampler(
+@@ -218,8 +225,42 @@
+             use_fp64=self.use_fp64_gumbel,
+         )
+ 
++    @property
++    def _hybrid_adaptive(self) -> bool:
++        """Hybrid adaptive verification (VLLM_DSPARK_ADAPTIVE_MIN_REQS): draft
++        steps of at most the threshold's (padded) request count take the fused
++        sampler, as with adaptive verification off; larger ones run the eager
++        Markov loop with the confidence head (or acceptance estimator)."""
++        return self.enable_adaptive_verification and adaptive_min_reqs() is not None
++
++    def _takes_fused_sampler(self, num_reqs: int) -> bool:
++        """Whether a draft step of ``num_reqs`` (padded) requests samples with the
++        fused sampler: always when it exists, except, under hybrid adaptive
++        verification, on steps above the threshold, which need the confidences.
++        ``num_reqs`` is the batch every tensor-parallel rank runs, and a FULL
++        graph's is its captured size, so capture and replay agree."""
++        return self._fused_sampler is not None and not (
++            self._hybrid_adaptive and adaptive_step(num_reqs)
++        )
++
++    def propose(self, *args, **kwargs) -> torch.Tensor:
++        # A propose that drafts nothing leaves no new confidences; without a
++        # threshold the runner records the buffer as before.
++        self.drafted_confidences = not self._hybrid_adaptive
++        return super().propose(*args, **kwargs)
++
++    def _prepare_graph_replay(self, input_batch, num_graph_reqs: int, *args, **kwargs):
++        # The FULL graph of num_graph_reqs requests replays the sampler its
++        # capture chose (see _sample_sequential).
++        self.drafted_confidences = not self._takes_fused_sampler(num_graph_reqs)
++        return super()._prepare_graph_replay(
++            input_batch, num_graph_reqs, *args, **kwargs
++        )
++
+     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+-        if self._fused_sampler is not None:
++        fused = self._takes_fused_sampler(num_reqs)
++        self.drafted_confidences = not fused
++        if fused:
+             self._sample_sequential_fused(num_reqs, head_hidden)
+             return
+         if self._draft_topk is not None:
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -159,6 +159,13 @@
+             assert isinstance(sampler, GPUWatermarkSampler)
+         self.num_speculative_steps = spec_config.num_speculative_tokens
+         self.enable_adaptive_verification = spec_config.enable_adaptive_verification
++        from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
++            adaptive_min_reqs,
++        )
++
++        # Hybrid adaptive verification (VLLM_DSPARK_ADAPTIVE_MIN_REQS): only the
++        # steps the runner made adaptive (max_query_len set) compact their logits.
++        self._per_step_adaptive = adaptive_min_reqs() is not None
+         rejection_sample_method = spec_config.rejection_sample_method
+         self.use_block_verification: bool = False
+         self.fly_window_size = 0
+@@ -188,7 +195,10 @@
+         cu_num_logits: torch.Tensor,
+         cu_num_logits_np: np.ndarray,
+         max_num_logprobs: int,
++        compacted: bool | None = None,
+     ) -> LogprobsTensors | None:
++        if compacted is None:
++            compacted = self.enable_adaptive_verification
+         if max_num_logprobs == NO_LOGPROBS:
+             return None
+ 
+@@ -208,7 +218,7 @@
+         expanded_logits = num_logits != num_reqs
+         cu_num_generated_tokens: list[int] | torch.Tensor | None = None
+         if expanded_logits:
+-            if self.enable_adaptive_verification:
++            if compacted:
+                 # Adaptive verification keeps the true per-request boundaries
+                 # on device only; cu_num_logits_np holds the pre-compacted layout.
+                 cu_num_generated_tokens = cu_num_logits.clone()
+@@ -295,6 +305,16 @@
+         )
+         return processed_logits, sampled, num_sampled
+ 
++    def _compacts_logits(self, input_batch: InputBatch) -> bool:
++        """Whether this step's per-request logits boundaries are decided on the
++        device (adaptive verification), so the host cu_num_logits_np only holds
++        the pre-compaction layout."""
++        if not self.enable_adaptive_verification:
++            return False
++        if not self._per_step_adaptive:
++            return True
++        return input_batch.max_query_len is not None
++
+     def _verify_in_chunks(
+         self,
+         logits: torch.Tensor,
+@@ -316,6 +336,7 @@
+         cu_num_logits_np = input_batch.cu_num_logits_np
+         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+         num_reqs = input_batch.num_reqs
++        compacted = self._compacts_logits(input_batch)
+ 
+         if logits.shape[0] <= max_chunk_logits:
+             # One chunk covers the batch. Adaptive verification compacts the logits
+@@ -324,7 +345,7 @@
+             # guarantees the compacted batch always lands here.
+             request_chunks: Iterable[tuple[int, int]] = ((0, num_reqs),)
+         else:
+-            assert not self.enable_adaptive_verification
++            assert not compacted
+             request_chunks = _iter_request_chunks(cu_num_logits_np, max_chunk_logits)
+ 
+         sampled_chunks: list[torch.Tensor] = []
+@@ -365,6 +386,7 @@
+                 chunk_cu_num_logits,
+                 chunk_cu_num_logits_np,
+                 max_num_logprobs,
++                compacted,
+             )
+             if chunk_logprobs is not None:
+                 logprobs_chunks.append(chunk_logprobs)
