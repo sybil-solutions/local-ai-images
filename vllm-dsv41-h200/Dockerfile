@@ -10,7 +10,9 @@
 #      BF16 operands for the executor's dense kernels, hybrid adaptive verification (VLLM_DSPARK_ADAPTIVE_MIN_REQS),
 #      the post-forward graph limit and forget_confidences without a host sync.
 #   3. /opt/deepseek/ssd/disk_engram.py: Engram tables read from the checkpoint on NVMe at decode (MIT, from Tech2wild).
-# Dependencies are pinned by constraints.txt; the build fails unless `pip freeze` equals freeze.expected.
+# Dependencies are pinned by constraints.txt (all but the two packages installed --no-deps after the wheel: humming-kernels,
+# whose 0.1.19 replaces the wheel's 0.1.18 pin, and flashinfer-jit-cache); the build fails unless `pip freeze` equals
+# freeze.expected.
 # No GPU needed to build. Serve: README.md.
 
 FROM vllm/vllm-openai:v0.30.0@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90
@@ -24,8 +26,8 @@ RUN pip uninstall -y vllm flashinfer-jit-cache flashinfer-cubin deep_ep >/dev/nu
     pip install --no-cache-dir -c /opt/dsv41-h200/constraints.txt --extra-index-url https://download.pytorch.org/whl/cu130 \
       /tmp/whl/vllm-0.32.1rc1.dev537+g51d2a8559-cp38-abi3-manylinux_2_28_x86_64.whl \
       torch==2.14.0+cu130 torchvision==0.29.0+cu130 torchaudio==2.11.0+cu130 \
-    && pip install --no-cache-dir --no-deps -c /opt/dsv41-h200/constraints.txt --extra-index-url https://flashinfer.ai/whl/cu130 flashinfer-jit-cache==0.7.2.post1 \
-    && pip install --no-cache-dir --no-deps -c /opt/dsv41-h200/constraints.txt humming-kernels==0.1.19 \
+    && pip install --no-cache-dir --no-deps --extra-index-url https://flashinfer.ai/whl/cu130 flashinfer-jit-cache==0.7.2.post1 \
+    && pip install --no-cache-dir --no-deps humming-kernels==0.1.19 \
     && rm -rf /tmp/whl \
     && pip freeze 2>/dev/null | grep -v '^vllm @ ' | LC_ALL=C sort > /tmp/freeze.txt \
     && LC_ALL=C sort /opt/dsv41-h200/freeze.expected | diff - /tmp/freeze.txt \
