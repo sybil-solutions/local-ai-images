@@ -44,7 +44,10 @@ RUN set -e; D=/usr/local/lib/python3.12/dist-packages; mkdir -p /tmp/pr; tar -xz
     ! find $D/vllm -name '*.rej' | grep -q .; \
     grep -q 'self._confidence_probs.index_fill_(0, input_batch.idx_mapping\[:num_reqs\], 1.0)' $D/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py; \
     grep -q 'VLLM_DSPARK_ADAPTIVE_MIN_REQS' $D/vllm/envs.py; \
-    grep -q 'VLLM_DSPARK_ADAPTIVE_FULL_REQS' $D/vllm/envs.py
+    grep -q 'VLLM_DSPARK_ADAPTIVE_FULL_REQS' $D/vllm/envs.py; \
+    # vllm#60945: the block-verification residual-mass kernel must bound its one-ahead read, or adaptive
+    # verification reads past draft_sampled and kills the engine with an illegal memory access under load.
+    grep -qE '_is_bonus_logit\(|tl\.num_programs\(0\)' $D/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
 
 # 3. SSD Engram reader.
 COPY ssd/ /opt/deepseek/ssd/
