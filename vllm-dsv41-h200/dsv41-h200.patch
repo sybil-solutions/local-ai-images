@@ -25,15 +25,16 @@
              and vllm_config.speculative_config.use_eagle_block_drop()
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -61,6 +61,7 @@
+@@ -61,6 +61,8 @@
      VLLM_XLA_CHECK_RECOMPILATION: bool = False
      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
      VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
 +    VLLM_DSPARK_ADAPTIVE_MIN_REQS: int | None = None
++    VLLM_DSPARK_ADAPTIVE_FULL_REQS: int | None = None
      VLLM_XPU_PP_MICROBATCH: bool = True
      VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
      VLLM_XLA_USE_SPMD: bool = False
-@@ -1102,6 +1103,15 @@
+@@ -1102,6 +1104,23 @@
      "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": lambda: int(
          os.getenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "8192")
      ),
@@ -44,6 +45,14 @@
 +    "VLLM_DSPARK_ADAPTIVE_MIN_REQS": lambda: (
 +        int(os.environ["VLLM_DSPARK_ADAPTIVE_MIN_REQS"])
 +        if os.environ.get("VLLM_DSPARK_ADAPTIVE_MIN_REQS", "").strip()
++        else None
++    ),
++    # DSpark hybrid adaptive verification: with adaptive verification on, steps of
++    # more than this many requests verify every scheduled draft (the adaptive budget
++    # is not applied). Unset: every adaptive step uses the budget.
++    "VLLM_DSPARK_ADAPTIVE_FULL_REQS": lambda: (
++        int(os.environ["VLLM_DSPARK_ADAPTIVE_FULL_REQS"])
++        if os.environ.get("VLLM_DSPARK_ADAPTIVE_FULL_REQS", "").strip()
 +        else None
 +    ),
      # If set, the OpenAI API server will stay alive even after the underlying
@@ -1929,7 +1938,7 @@
  from typing import TYPE_CHECKING
  
  import numpy as np
-@@ -33,6 +34,27 @@
+@@ -33,6 +34,40 @@
      from vllm.v1.worker.utils import AttentionGroup
  
  
@@ -1946,6 +1955,19 @@
 +    return value
 +
 +
++@cache
++def adaptive_full_reqs() -> int | None:
++    """VLLM_DSPARK_ADAPTIVE_FULL_REQS: with adaptive verification on, adaptive steps
++    of more than this many requests verify every scheduled draft instead of the
++    cost-model budget. None (unset): the budget applies to every adaptive step."""
++    value = envs.VLLM_DSPARK_ADAPTIVE_FULL_REQS
++    if value is not None and value < 0:
++        raise ValueError(
++            f"VLLM_DSPARK_ADAPTIVE_FULL_REQS must be >= 0, got {value}"
++        )
++    return value
++
++
 +def adaptive_step(num_reqs: int) -> bool:
 +    """Whether a step of ``num_reqs`` requests verifies adaptively (when adaptive
 +    verification is on). A function of the step's request count only, which every
@@ -1957,10 +1979,11 @@
  def resolve_adaptive_cudagraph_mode(
      mode: CUDAGraphMode, *, piecewise_capture_available: bool
  ) -> CUDAGraphMode:
-@@ -302,6 +324,27 @@
+@@ -301,6 +336,27 @@
+         with stream(self._copy_stream, current_stream):
              write_slot.copy_to_cpu()
              self._copy_events[write_idx].record()
- 
++
 +    def forget_confidences(self, input_batch: "InputBatch") -> None:
 +        """This step's drafts carry no confidences (hybrid adaptive verification:
 +        the draft step, at or below the threshold, took the fused sampler). Reset
@@ -1981,10 +2004,25 @@
 +        # index copies it from pageable host memory and blocks the host for the
 +        # whole step on every hybrid step at or below the threshold.
 +        self._confidence_probs.index_fill_(0, input_batch.idx_mapping[:num_reqs], 1.0)
-+
+ 
      def get_num_tokens(
          self,
-         num_tokens_per_req: dict[str, int],
+@@ -364,7 +420,14 @@
+             req_id: int(num_tokens)
+             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
+         }
+-        draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
++        full_reqs = adaptive_full_reqs()
++        if full_reqs is not None and num_reqs > full_reqs:
++            # Large batches: verify every scheduled draft that fits the logits chunk.
++            draft_budget = max_draft_budget
++        else:
++            draft_budget = int(
++                np.argmax(num_tokens_to_estimated_accepted_tokens / costs)
++            )
+         self._batch_budget = (
+             num_drafts_per_req,
+             num_non_draft_tokens_per_req,
 --- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 @@ -34,6 +34,10 @@
