@@ -7,7 +7,8 @@
 #   2. dsv41-h200.patch (24 files): the changes this image adds on top, all lossless (README.md has the list):
 #      SSD Engram reader hooks, vllm#56697 MXFP4 Marlin padding backport, vllm#59418 small-head sparse decode backport,
 #      a P2P-store fallback for the executor's NVLink all-reduce on nodes without NVSwitch (H200 NVL bridges),
-#      BF16 operands for the executor's dense kernels, hybrid adaptive verification (VLLM_DSPARK_ADAPTIVE_MIN_REQS),
+#      BF16 operands for the executor's dense kernels, hybrid adaptive verification (VLLM_DSPARK_ADAPTIVE_MIN_REQS,
+#      VLLM_DSPARK_ADAPTIVE_FULL_REQS),
 #      the post-forward graph limit and forget_confidences without a host sync.
 #   3. /opt/deepseek/ssd/disk_engram.py: Engram tables read from the checkpoint on NVMe at decode (MIT, from Tech2wild).
 # Dependencies are pinned by constraints.txt (all but the two packages installed --no-deps after the wheel: humming-kernels,
@@ -42,7 +43,11 @@ RUN set -e; D=/usr/local/lib/python3.12/dist-packages; mkdir -p /tmp/pr; tar -xz
     cd $D && patch -p1 --forward --batch --no-backup-if-mismatch < /opt/dsv41-h200/dsv41-h200.patch; \
     ! find $D/vllm -name '*.rej' | grep -q .; \
     grep -q 'self._confidence_probs.index_fill_(0, input_batch.idx_mapping\[:num_reqs\], 1.0)' $D/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py; \
-    grep -q 'VLLM_DSPARK_ADAPTIVE_MIN_REQS' $D/vllm/envs.py
+    grep -q 'VLLM_DSPARK_ADAPTIVE_MIN_REQS' $D/vllm/envs.py; \
+    grep -q 'VLLM_DSPARK_ADAPTIVE_FULL_REQS' $D/vllm/envs.py; \
+    # vllm#60945: the block-verification residual-mass kernel must bound its one-ahead read, or adaptive
+    # verification reads past draft_sampled and kills the engine with an illegal memory access under load.
+    grep -qE '_is_bonus_logit\(|tl\.num_programs\(0\)' $D/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
 
 # 3. SSD Engram reader.
 COPY ssd/ /opt/deepseek/ssd/
@@ -69,7 +74,8 @@ ENV HF_HUB_OFFLINE=1 \
     DSV41_MARLIN_IALIGN=64 \
     DSV41_SMALL_HEAD_DECODE=1 \
     DSV41_SD_DENSE_BF16=1 \
-    VLLM_DSPARK_ADAPTIVE_MIN_REQS=16
+    VLLM_DSPARK_ADAPTIVE_MIN_REQS=16 \
+    VLLM_DSPARK_ADAPTIVE_FULL_REQS=160
 
 # CPU import check (no GPU or driver in the build): every module the launch touches imports.
 RUN CUDA_VISIBLE_DEVICES= python3 -c "import importlib; [importlib.import_module(m) for m in ['disk_engram', 'vllm.models.deepseek_v41.common.engram', 'vllm.models.deepseek_v41.nvidia.model_state', 'vllm.models.deepseek_v41.nvidia.flashmla', 'vllm.models.deepseek_v41.nvidia.ops.small_head_sparse_decode', 'vllm.models.deepseek_v41.nvidia.specialized_decode', 'vllm.models.deepseek_v41.nvidia.specialized_decode.hopper.decode', 'vllm.models.deepseek_v41.nvidia.specialized_decode.hopper.moe', 'vllm.models.deepseek_v41.nvidia.specialized_decode.hopper.dense', 'vllm.models.deepseek_v41.nvidia.specialized_decode.hopper.steps', 'vllm.model_executor.layers.fused_moe.oracle.mxfp4', 'vllm.v1.worker.gpu.spec_decode.adaptive_verification']]; import torch, vllm, flashinfer, humming; print('IMPORT_OK', torch.__version__, vllm.__version__, flashinfer.__version__)"
