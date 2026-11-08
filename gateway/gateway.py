@@ -18,9 +18,13 @@ being written or replaced never opens the gateway.
 
 Usage: when GATEWAY_USAGE_LOG names a file, one JSON line per answered
 request is appended to it: {t, api, model, prompt, completion, estimated,
-ttft_ms, ms}. Tokens come from the engine's usage block when it sends one,
-otherwise one per streamed delta (estimated: true). The plugin reads the file
-for the tokens-per-day and decode-speed figures on the card.
+ttft_ms, ms}, plus cached and reasoning when the engine reports them. Tokens
+come from the engine's usage block when it sends one, otherwise one per
+streamed delta (estimated: true). cached is prompt_tokens_details.cached_tokens
+(part of prompt); reasoning is completion_tokens_details.reasoning_tokens, or
+SGLang's top-level reasoning_tokens. An engine that reports neither leaves them
+out, so a missing count is never read as zero. The plugin reads the file for
+the tokens-per-day and decode-speed figures on the card.
 
 Connections: at most GATEWAY_MAX_CONNECTIONS (default 64) are served at once;
 one more is closed at once. Each request, its headers and body, must arrive
@@ -84,6 +88,29 @@ def required_key():
         return None
 
 
+def usage_details(usage):
+    """The engine's cached-input and reasoning-output counts, each None when the engine did not report it."""
+    usage = usage or {}
+    prompt = usage.get("prompt_tokens_details")
+    completion = usage.get("completion_tokens_details")
+    cached = prompt.get("cached_tokens") if isinstance(prompt, dict) else None
+    reasoning = completion.get("reasoning_tokens") if isinstance(completion, dict) else None
+    if reasoning is None:
+        reasoning = usage.get("reasoning_tokens")  # SGLang reports this count top level, not under details
+    count = lambda value: value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+    return count(cached), count(reasoning)
+
+
+def responses_usage(usage):
+    """OpenAI Responses usage: cached and reasoning tokens are parts of input and output, never more than them."""
+    cached, reasoning = usage_details(usage)
+    prompt, output = usage.get("prompt_tokens") or 0, usage.get("completion_tokens") or 0
+    # SGLang counts reasoning outside completion_tokens (17 of a 16-token answer), so it is capped here
+    return {"input_tokens": prompt, "output_tokens": output, "total_tokens": usage.get("total_tokens", 0),
+            "input_tokens_details": {"cached_tokens": min(cached or 0, prompt)},
+            "output_tokens_details": {"reasoning_tokens": min(reasoning or 0, output)}}
+
+
 class Meter:
     """One answer's accounting: tokens from the engine's usage when it sends one, else one per delta; time to first token."""
 
@@ -106,9 +133,14 @@ class Meter:
             return
         usage = usage or self.usage or {}
         now = time.monotonic()
+        cached, reasoning = usage_details(usage)
         row = {"t": int(time.time()), "api": self.api, "model": self.model, "prompt": usage.get("prompt_tokens", 0),
                "completion": usage.get("completion_tokens") or self.counted, "estimated": not usage,
                "ttft_ms": int(((self.first or now) - self.t0) * 1000), "ms": int((now - self.t0) * 1000)}
+        if cached is not None:
+            row["cached"] = cached
+        if reasoning is not None:
+            row["reasoning"] = reasoning
         try:
             with USAGE_LOCK, open(USAGE_LOG, "a") as handle:
                 handle.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -372,10 +404,16 @@ def chat_to_anthropic(resp, model):
         content.append({"type": "tool_use", "id": call.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
                         "name": function.get("name"), "input": arguments})
     usage = resp.get("usage") or {}
+    cached, _ = usage_details(usage)
+    prompt = usage.get("prompt_tokens") or 0
+    # Anthropic counts a cache read apart from input_tokens: total input = input_tokens + cache_read_input_tokens
+    tokens = {"input_tokens": prompt - min(cached or 0, prompt), "output_tokens": usage.get("completion_tokens", 0)}
+    if cached is not None:
+        tokens["cache_read_input_tokens"] = min(cached, prompt)
     return {
         "id": "msg_" + uuid.uuid4().hex[:24], "type": "message", "role": "assistant", "model": model,
         "content": content, "stop_reason": anthropic_stop(choice.get("finish_reason"), bool(tool_calls)), "stop_sequence": None,
-        "usage": {"input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0)},
+        "usage": tokens,
     }
 
 
@@ -505,9 +543,7 @@ def chat_to_responses(resp, model, req):
                        "name": function.get("name"), "arguments": function.get("arguments") or "{}", "status": "completed"})
     usage = resp.get("usage") or {}
     envelope = responses_envelope(model, req)
-    envelope.update({"status": "completed", "output": output,
-                     "usage": {"input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0),
-                               "total_tokens": usage.get("total_tokens", 0), "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}}})
+    envelope.update({"status": "completed", "output": output, "usage": responses_usage(usage)})
     return envelope
 
 
@@ -573,8 +609,7 @@ def responses_stream(handler, upstream, model, req, meter=None):
         output.append((call["index"], item))
         event("response.output_item.done", {"output_index": call["index"], "item": item})
     envelope.update({"status": "completed", "output": [item for _, item in sorted(output, key=lambda pair: pair[0])],
-                     "usage": {"input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0),
-                               "total_tokens": usage.get("total_tokens", 0), "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}}})
+                     "usage": responses_usage(usage)})
     event("response.completed", {"response": envelope})
     if meter:
         meter.done(usage)
