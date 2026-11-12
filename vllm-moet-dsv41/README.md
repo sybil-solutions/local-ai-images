@@ -25,6 +25,12 @@ parallel `pread` (`VLLM_MOET_ENGRAM_DISK_THREADS`, default 16), inside the captu
 function between an async copy of the row ids and the unchanged lookup kernel). Bit-exact
 (`test_engram_disk.py`). Upstream holds the table in ~330 GB of host shared memory; this runs on a 128 GB host.
 
+`engram_disk_v3` is a second build of that host function with the same ABI, for decode latency: rows are copied from a
+read-only mmap of the checkpoint instead of one `pread` each, and gathers above `VLLM_MOET_ENGRAM_DISK_INLINE` rows
+(default 256) use a persistent worker pool instead of creating threads at every step. It is not the default; choose it
+with `VLLM_MOET_ENGRAM_DISK_LIB=/opt/vllm-moet/engram_disk/libengram_disk_v3.so`. `test_engram_disk.py` checks
+whichever library that variable names.
+
 ## Serve
 
 The recipe (launch, measured numbers, quality gate) lives in

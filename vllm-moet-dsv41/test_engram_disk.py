@@ -74,7 +74,7 @@ d.cap_tokens = 0
 d.jobs = {}
 if E._MoetEngramDisk._lib is None:
     import ctypes
-    lib = ctypes.CDLL("/opt/vllm-moet/engram_disk/libengram_disk.so")
+    lib = ctypes.CDLL(os.environ.get("VLLM_MOET_ENGRAM_DISK_LIB", "/opt/vllm-moet/engram_disk/libengram_disk.so"))  # either build
     lib.engram_host_gather_ptr.restype = ctypes.c_void_p
     cuda = ctypes.CDLL("libcuda.so.1")
     cuda.cuLaunchHostFunc.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)

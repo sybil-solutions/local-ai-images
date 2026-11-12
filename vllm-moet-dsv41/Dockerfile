@@ -317,12 +317,17 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
 
 # ---------------------------------------------------------------- engram_disk (ours)
 COPY --from=src /src/LICENSE /src/NOTICE /opt/vllm-moet/
-COPY engram_disk.c patch_vllm_engram_disk.py test_engram_disk.py /opt/vllm-moet/engram_disk/
+COPY engram_disk.c engram_disk_v3.c patch_vllm_engram_disk.py test_engram_disk.py /opt/vllm-moet/engram_disk/
+# Two builds of the same host function, same ABI. libengram_disk.so is the default. libengram_disk_v3.so copies rows
+# from a read-only mmap of the checkpoint and keeps a worker pool, for decode latency; it is chosen at run time with
+# VLLM_MOET_ENGRAM_DISK_LIB=/opt/vllm-moet/engram_disk/libengram_disk_v3.so.
 RUN gcc -O2 -fPIC -shared -pthread -o /opt/vllm-moet/engram_disk/libengram_disk.so /opt/vllm-moet/engram_disk/engram_disk.c \
+ && gcc -O2 -fPIC -shared -pthread -o /opt/vllm-moet/engram_disk/libengram_disk_v3.so /opt/vllm-moet/engram_disk/engram_disk_v3.c \
  && python3 /opt/vllm-moet/engram_disk/patch_vllm_engram_disk.py "$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))')" \
  && python3 -c "import vllm.models.deepseek_v41.common.engram as e; assert hasattr(e, '_MoetEngramDisk'); import vllm.model_executor.model_loader.weight_utils as w; assert hasattr(w, '_moet_should_skip_weight'); print('engram disk ok')"
 ENV VLLM_MOET_ENGRAM_DISK=1
 LABEL com.vllm-moet.engram-disk="1" \
+      com.vllm-moet.engram-disk-v3="/opt/vllm-moet/engram_disk/libengram_disk_v3.so" \
       com.vllm-moet.source="https://github.com/kacper-daftcode/vLLM-Moet/tree/b0dc737ae431d9a2ab3f62ed3fc30313b00d99c1" \
       org.opencontainers.image.source="https://github.com/sybil-solutions/local-ai-images" \
       org.opencontainers.image.description="vLLM-Moet r21 (DeepSeek-V4.1-Flash, sm_120, TP4) + Engram tables read from NVMe" \
