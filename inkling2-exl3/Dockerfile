@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git python3-pip
 RUN pip install --no-cache-dir uv==0.10.2
 
 # Engine source: github.com/0xSero/inkling2-exl3 at a pinned commit (overlay, patches, server, scripts, locks)
-ARG INKLING2_COMMIT=8ba45137011b5df7660d190e909560e05b07a2a9
+ARG INKLING2_COMMIT=d98291637e55c8573744f121245b0d6f0ba586e8
 RUN git init -q /src && cd /src \
     && git fetch -q --depth 1 https://github.com/0xSero/inkling2-exl3.git ${INKLING2_COMMIT} \
     && git checkout -q FETCH_HEAD && test "$(git rev-parse HEAD)" = "${INKLING2_COMMIT}" \
