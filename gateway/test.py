@@ -60,6 +60,14 @@ class FakeEngine(BaseHTTPRequestHandler):
         last_user = next((m for m in reversed(req["messages"]) if m["role"] == "user"), {"content": ""})
         wants_tool = bool(req.get("tools")) and "use the tool" in str(last_user.get("content", ""))
         has_tool_result = any(m["role"] == "tool" for m in req["messages"])
+        def usage():
+            block = {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}
+            if req.get("test_usage") == "top" or "top usage" in json.dumps(req["messages"]):
+                block["reasoning_tokens"] = 9  # SGLang's shape: top level, outside completion_tokens_details
+            elif req.get("test_usage") != "plain":
+                block["prompt_tokens_details"] = {"cached_tokens": 6}
+                block["completion_tokens_details"] = {"reasoning_tokens": 3}
+            return block
         if wants_tool and not has_tool_result:
             message = {"role": "assistant", "content": None, "tool_calls": [
                 {"id": "call_abc", "type": "function", "function": {"name": "shell", "arguments": json.dumps({"command": "echo hi"})}}]}
@@ -83,13 +91,13 @@ class FakeEngine(BaseHTTPRequestHandler):
                 for word in ("Hello ", "from ", "the ", "engine"):
                     sse(dict(base, choices=[{"index": 0, "delta": {"content": word}, "finish_reason": None}]))
             sse(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": finish}]))
-            sse(dict(base, choices=[], usage={"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}))
+            sse(dict(base, choices=[], usage=usage()))
             self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
             self.close_connection = True
             return
         body = json.dumps({"id": "chatcmpl-1", "object": "chat.completion", "model": req["model"],
                            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-                           "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}}).encode()
+                           "usage": usage()}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -334,6 +342,7 @@ def main():
         # Anthropic Messages, non-streaming
         status, body = call("/v1/messages", {"model": "claude-x", "max_tokens": 64, "system": "be brief", "messages": [{"role": "user", "content": "hi"}]})
         check("messages: text reply", status == 200 and body["type"] == "message" and body["content"][0]["text"] == "Hello from the engine" and body["stop_reason"] == "end_turn", str(body))
+        check("messages: a cache read is counted apart from input tokens", body["usage"]["cache_read_input_tokens"] == 6 and body["usage"]["input_tokens"] == 4, str(body["usage"]))
         check("messages: system becomes a system message", FakeEngine.last_request["messages"][0] == {"role": "system", "content": "be brief"}, str(FakeEngine.last_request))
         tools = [{"name": "shell", "description": "run", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}]
         status, body = call("/v1/messages", {"model": "claude-x", "max_tokens": 64, "tools": tools, "messages": [{"role": "user", "content": "please use the tool"}]})
@@ -364,6 +373,7 @@ def main():
         check("tools: pattern and format are scrubbed from parameter schemas", "pattern" not in params["properties"]["path"] and "format" not in params["properties"]["path"] and params["required"] == ["path"], str(params))
         status, body = call("/v1/responses", {"model": "gpt-x", "instructions": "be brief", "input": "hi"})
         check("responses: text output", status == 200 and body["object"] == "response" and body["status"] == "completed" and body["output"][0]["content"][0]["text"] == "Hello from the engine", str(body))
+        check("responses: usage details are reported", body["usage"]["input_tokens_details"]["cached_tokens"] == 6 and body["usage"]["output_tokens_details"]["reasoning_tokens"] == 3, str(body["usage"]))
         rtools = [{"type": "function", "name": "shell", "description": "run", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}]
         status, body = call("/v1/responses", {"model": "gpt-x", "instructions": "be brief",
             "input": [{"type": "message", "role": "user", "content": "hi"}, {"type": "message", "role": "developer", "content": "answer in French"}]})
@@ -386,6 +396,7 @@ def main():
         check("responses: stream sequence numbers", [e["sequence_number"] for e in events] == list(range(1, len(events) + 1)), str([e["sequence_number"] for e in events]))
         final = events[-1]["response"]
         check("responses: completed carries the output", final["status"] == "completed" and final["output"][0]["content"][0]["text"] == "Hello from the engine", str(final))
+        check("responses: streamed usage details are reported", final["usage"]["input_tokens_details"]["cached_tokens"] == 6 and final["usage"]["output_tokens_details"]["reasoning_tokens"] == 3, str(final["usage"]))
         status, events = call("/v1/responses", {"model": "gpt-x", "stream": True, "tools": rtools, "input": "please use the tool"}, stream=True)
         done = [e for e in events if e["type"] == "response.function_call_arguments.done"]
         check("responses: streamed function call", done and json.loads(done[0]["arguments"]) == {"command": "echo hi"} and events[-1]["response"]["output"][0]["type"] == "function_call", str(events))
@@ -426,6 +437,19 @@ def main():
         check("usage log: every dialect is recorded", apis == {"chat", "messages", "responses"}, str(apis))
         check("usage log: engine usage is used verbatim, streamed chat included", all(row["completion"] == 4 and row["prompt"] == 10 and not row["estimated"] for row in rows), str([r for r in rows if r["estimated"] or r["prompt"] != 10][:3]))
         check("usage log: model, timing and time-to-first-token are present", all(row["model"] == "fake-model" and row["ms"] >= row["ttft_ms"] >= 0 for row in rows), str(rows[:1]))
+        check("usage log: cached and reasoning tokens are recorded", all(row["cached"] == 6 and row["reasoning"] == 3 for row in rows), str(rows[:1]))
+        status, body = call("/v1/chat/completions", {"model": "m", "test_usage": "plain", "messages": [{"role": "user", "content": "hi"}]})
+        time.sleep(0.1)
+        rows = [json.loads(line) for line in open(usage_log)]
+        check("usage log: counts the engine does not report are left out, not zero", "cached" not in rows[-1] and "reasoning" not in rows[-1] and rows[-1]["prompt"] == 10 and not rows[-1]["estimated"], str(rows[-1]))
+        status, body = call("/v1/chat/completions", {"model": "m", "test_usage": "top", "messages": [{"role": "user", "content": "hi"}]})
+        time.sleep(0.1)
+        rows = [json.loads(line) for line in open(usage_log)]
+        check("usage log: SGLang's top-level reasoning count is recorded as reported", rows[-1]["reasoning"] == 9 and "cached" not in rows[-1], str(rows[-1]))
+        status, body = call("/v1/responses", {"model": "gpt-x", "input": "top usage"})
+        check("responses: reasoning past the output count is capped at it", body["usage"]["output_tokens_details"]["reasoning_tokens"] == 4 and body["usage"]["input_tokens_details"]["cached_tokens"] == 0, str(body["usage"]))
+        status, body = call("/v1/messages", {"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "top usage"}]})
+        check("messages: no cache field when the engine reports none", "cache_read_input_tokens" not in body["usage"] and body["usage"]["input_tokens"] == 10, str(body["usage"]))
 
         # A client without the key cannot hold the gateway: a request trickled in byte by byte is cut at the deadline,
         # and with every slot held an extra connection is closed, until the deadline frees the slots again.
