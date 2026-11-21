@@ -28,6 +28,8 @@ DEADLINE, SLOTS = 1.0, 4
 # records when its client (the gateway) closes, so we can see the gateway cut it off.
 SLOW_ENGINE_PORT, SLOW_GATEWAY_PORT = 18001, 18435
 GATEWAY_FILE = os.environ.get("GATEWAY_FILE", os.path.join(HERE, "gateway.py"))
+sys.path.insert(0, HERE)
+import gateway as gw  # noqa: E402  (the module under test's parsing; the server itself runs as a subprocess)
 
 
 class FakeEngine(BaseHTTPRequestHandler):
@@ -38,6 +40,16 @@ class FakeEngine(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path.split("?")[0] == "/metrics":
+            body = ("# HELP vllm:num_requests_running Running requests\n"
+                    "vllm:num_requests_running{model_name=\"fake-model\"} 1.0\n"
+                    "vllm:num_requests_waiting{model_name=\"fake-model\"} 2.0\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         body = json.dumps({"object": "list", "data": [{"id": "fake-model", "object": "model"}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -299,7 +311,8 @@ def main():
     key_file.write(KEY + "\n"); key_file.close()
     usage_log = os.path.join(tempfile.mkdtemp(), "usage.jsonl")
     env = dict(os.environ, UPSTREAM=f"http://127.0.0.1:{ENGINE_PORT}", GATEWAY_PORT=str(GATEWAY_PORT), GATEWAY_KEY_FILE=key_file.name, MODEL="fake-model",
-               GATEWAY_USAGE_LOG=usage_log, GATEWAY_REQUEST_DEADLINE=str(DEADLINE), GATEWAY_MAX_CONNECTIONS=str(SLOTS))
+               GATEWAY_USAGE_LOG=usage_log, GATEWAY_REQUEST_DEADLINE=str(DEADLINE), GATEWAY_MAX_CONNECTIONS=str(SLOTS),
+               GATEWAY_QUEUE_POLL="0.05")
     gateway = subprocess.Popen([sys.executable, GATEWAY_FILE], env=env, stderr=subprocess.PIPE)
     try:
         for _ in range(50):
@@ -307,6 +320,7 @@ def main():
                 urllib.request.urlopen(f"http://127.0.0.1:{GATEWAY_PORT}/health", timeout=1); break
             except Exception:
                 time.sleep(0.1)
+        time.sleep(0.2)  # the metrics poller runs before the first answered request is logged
         status, body = call("/v1/models")
         check("models passthrough", status == 200 and body["data"][0]["id"] == "fake-model", str(body))
         status, body = call("/v1/models", key="")
@@ -426,6 +440,13 @@ def main():
         check("usage log: every dialect is recorded", apis == {"chat", "messages", "responses"}, str(apis))
         check("usage log: engine usage is used verbatim, streamed chat included", all(row["completion"] == 4 and row["prompt"] == 10 and not row["estimated"] for row in rows), str([r for r in rows if r["estimated"] or r["prompt"] != 10][:3]))
         check("usage log: model, timing and time-to-first-token are present", all(row["model"] == "fake-model" and row["ms"] >= row["ttft_ms"] >= 0 for row in rows), str(rows[:1]))
+        check("usage log: engine occupancy is recorded", rows[-1].get("running") == 1 and rows[-1].get("queued") == 2, str(rows[-1]))
+        check("queue metrics: vLLM and SGLang names are summed", gw.queue_from_metrics(
+            "vllm:num_requests_running{a=\"1\"} 1\nvllm:num_requests_running{a=\"2\"} 2\nvllm:num_requests_waiting 0\n") == (3, 0)
+            and gw.queue_from_metrics('sglang:num_running_reqs{model="x"} 4\nsglang:num_queue_reqs 5\n') == (4, 5))
+        check("queue metrics: an engine without them reports nothing", gw.queue_from_metrics("process_cpu_seconds_total 1.2\n") == (None, None))
+        check("queue metrics: an infinite or malformed sample is skipped", gw.queue_from_metrics(
+            "vllm:num_requests_running +Inf\nvllm:num_requests_running 2\nvllm:num_requests_waiting x\n") == (2, None))
 
         # A client without the key cannot hold the gateway: a request trickled in byte by byte is cut at the deadline,
         # and with every slot held an extra connection is closed, until the deadline frees the slots again.

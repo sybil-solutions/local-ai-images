@@ -19,8 +19,10 @@ being written or replaced never opens the gateway.
 Usage: when GATEWAY_USAGE_LOG names a file, one JSON line per answered
 request is appended to it: {t, api, model, prompt, completion, estimated,
 ttft_ms, ms}. Tokens come from the engine's usage block when it sends one,
-otherwise one per streamed delta (estimated: true). The plugin reads the file
-for the tokens-per-day and decode-speed figures on the card.
+otherwise one per streamed delta (estimated: true). running and queued, the
+engine's occupancy when the request arrived, are added when its /metrics
+reports them (vLLM and SGLang do). The plugin reads the file for the
+tokens-per-day and decode-speed figures on the card.
 
 Connections: at most GATEWAY_MAX_CONNECTIONS (default 64) are served at once;
 one more is closed at once. Each request, its headers and body, must arrive
@@ -53,6 +55,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -66,6 +69,11 @@ USAGE_LOCK = threading.Lock()
 REQUEST_DEADLINE = float(os.environ.get("GATEWAY_REQUEST_DEADLINE", "10"))
 WRITE_DEADLINE = float(os.environ.get("GATEWAY_WRITE_DEADLINE", "30"))
 MAX_CONNECTIONS = int(os.environ.get("GATEWAY_MAX_CONNECTIONS", "64"))
+QUEUE_POLL = float(os.environ.get("GATEWAY_QUEUE_POLL", "2"))  # seconds between /metrics reads; 0 disables
+QUEUE_METRICS = {"running": ("vllm:num_requests_running", "sglang:num_running_reqs"),
+                 "queued": ("vllm:num_requests_waiting", "sglang:num_queue_reqs")}
+QUEUE = {"running": None, "queued": None, "at": 0.0}
+QUEUE_LOCK = threading.Lock()
 
 
 def log(msg):
@@ -84,12 +92,56 @@ def required_key():
         return None
 
 
+def queue_from_metrics(text):
+    """Running and queued request counts from Prometheus text; None for a count the engine does not report."""
+    sums = {"running": None, "queued": None}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or line.startswith("#"):
+            continue
+        name = parts[0].split("{", 1)[0]
+        for key, names in QUEUE_METRICS.items():
+            if name in names:
+                try:
+                    value = int(float(parts[1]))
+                except (ValueError, OverflowError):  # a malformed or infinite sample is skipped, not summed
+                    continue
+                sums[key] = (sums[key] or 0) + value
+    return sums["running"], sums["queued"]
+
+
+def queue_snapshot():
+    """The latest occupancy if it is fresh; None for either count the engine never reported."""
+    with QUEUE_LOCK:
+        if not QUEUE["at"] or time.monotonic() - QUEUE["at"] > max(3 * QUEUE_POLL, 6):
+            return None, None
+        return QUEUE["running"], QUEUE["queued"]
+
+
+def poll_queue():
+    """Keep QUEUE current from the engine's /metrics. A failure backs off for a minute: most engines have no such route."""
+    delay = QUEUE_POLL
+    while QUEUE_POLL > 0:
+        try:
+            with urllib.request.urlopen(UPSTREAM + "/metrics", timeout=2) as response:
+                running, queued = queue_from_metrics(response.read(1 << 20).decode("utf-8", "replace"))
+            with QUEUE_LOCK:
+                QUEUE.update(running=running, queued=queued, at=time.monotonic())
+            delay = QUEUE_POLL
+        except Exception:  # a refused or truncated scrape (IncompleteRead) must not end the thread for the gateway's life
+            with QUEUE_LOCK:
+                QUEUE.update(running=None, queued=None, at=0.0)
+            delay = max(60.0, QUEUE_POLL)
+        time.sleep(delay)
+
+
 class Meter:
     """One answer's accounting: tokens from the engine's usage when it sends one, else one per delta; time to first token."""
 
     def __init__(self, api, model):
         self.api, self.model, self.t0 = api, model, time.monotonic()
         self.first, self.counted, self.usage = None, 0, None
+        self.queue = queue_snapshot()  # what the request found on arrival: the queue that explains its time to first token
 
     def chunk(self, obj):
         if obj.get("usage"):
@@ -109,6 +161,11 @@ class Meter:
         row = {"t": int(time.time()), "api": self.api, "model": self.model, "prompt": usage.get("prompt_tokens", 0),
                "completion": usage.get("completion_tokens") or self.counted, "estimated": not usage,
                "ttft_ms": int(((self.first or now) - self.t0) * 1000), "ms": int((now - self.t0) * 1000)}
+        running, queued = self.queue
+        if running is not None:
+            row["running"] = running
+        if queued is not None:
+            row["queued"] = queued
         try:
             with USAGE_LOCK, open(USAGE_LOG, "a") as handle:
                 handle.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -835,6 +892,8 @@ class Server(ThreadingHTTPServer):
 
 def main():
     server = Server(("0.0.0.0", PORT), Handler)
+    if QUEUE_POLL > 0 and USAGE_LOG:
+        threading.Thread(target=poll_queue, name="queue", daemon=True).start()
     log(f"gateway listening on :{PORT}, engine {UPSTREAM}, key {'not set' if required_key() == '' else 'required'}, usage log {USAGE_LOG or 'off'}")
     try:
         server.serve_forever()
