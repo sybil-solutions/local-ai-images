@@ -6,7 +6,7 @@ UPSTREAM (default http://engine:8000), which speaks OpenAI chat completions.
 
   /v1/models, /v1/chat/completions   pass through unchanged (streaming too)
   /v1/messages                       Anthropic Messages  -> chat completions
-  /v1/messages/count_tokens          rough estimate, Anthropic shape
+  /v1/messages/count_tokens          engine /tokenize, else a rough estimate
   /v1/responses                      OpenAI Responses    -> chat completions
   /health                            200 when the engine answers /v1/models
 
@@ -63,6 +63,7 @@ MODEL_ALIAS = os.environ.get("MODEL", "")  # served model id; client model names
 TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "600"))
 USAGE_LOG = os.environ.get("GATEWAY_USAGE_LOG", "")
 USAGE_LOCK = threading.Lock()
+COUNT_TIMEOUT = 5  # seconds the engine's /tokenize may take before count_tokens answers with its estimate
 REQUEST_DEADLINE = float(os.environ.get("GATEWAY_REQUEST_DEADLINE", "10"))
 WRITE_DEADLINE = float(os.environ.get("GATEWAY_WRITE_DEADLINE", "30"))
 MAX_CONNECTIONS = int(os.environ.get("GATEWAY_MAX_CONNECTIONS", "64"))
@@ -120,9 +121,9 @@ class Meter:
 class Upstream:
     """One HTTP request to the engine. `stream()` yields SSE data payloads as parsed JSON."""
 
-    def __init__(self, method, path, body=None):
+    def __init__(self, method, path, body=None, timeout=TIMEOUT):
         parsed = urllib.parse.urlparse(UPSTREAM)
-        self.conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=TIMEOUT)
+        self.conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=timeout)
         headers = {"Content-Type": "application/json", "Accept": "*/*"}
         data = json.dumps(body).encode() if body is not None else None
         self.conn.request(method, path, body=data, headers=headers)  # request is sent; the answer is read by begin()
@@ -696,8 +697,7 @@ class Handler(BaseHTTPRequestHandler):
             if path in ("/v1/messages", "/messages"):
                 return self.handle_messages(body)
             if path in ("/v1/messages/count_tokens", "/messages/count_tokens"):
-                text = json.dumps(body.get("messages", [])) + json.dumps(body.get("system", ""))
-                return self.send_json(200, {"input_tokens": max(1, len(text) // 4)})
+                return self.count_tokens(body)
             if path in ("/v1/responses", "/responses"):
                 return self.handle_responses(body)
             if path in ("/v1/completions", "/completions"):
@@ -782,6 +782,27 @@ class Handler(BaseHTTPRequestHandler):
             resp = up.json()
             meter.done(resp.get("usage"))
             self.send_json(200, chat_to_anthropic(resp, model))
+
+    def count_tokens(self, req):
+        """The engine's own token count for the exact prompt; a rough estimate when it has no /tokenize or is too
+        slow to answer one (a busy engine must not hold a count the client asks for before every turn)."""
+        text = json.dumps(req.get("messages", [])) + json.dumps(req.get("system", "")) + (json.dumps(req["tools"]) if req.get("tools") else "")
+        try:
+            chat = anthropic_to_chat(req)
+            probe = {"model": chat["model"], "messages": chat["messages"]}
+            if chat.get("tools"):
+                probe["tools"] = chat["tools"]
+            up = Upstream("POST", "/tokenize", probe, timeout=COUNT_TIMEOUT)
+            up.begin()
+            if up.status == 200:
+                count = up.json().get("count")
+                if isinstance(count, int) and count > 0:
+                    return self.send_json(200, {"input_tokens": count})
+            else:
+                up.raw()
+        except (ConnectionError, OSError, http.client.HTTPException, ValueError, KeyError):
+            pass
+        self.send_json(200, {"input_tokens": max(1, len(text) // 4)})
 
     def handle_responses(self, body):
         model = body.get("model") or MODEL_ALIAS
