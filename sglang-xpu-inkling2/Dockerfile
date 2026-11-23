@@ -52,7 +52,7 @@ RUN printf 'tml-renderers==0.4.2 --hash=sha256:da7cff5cca1447e2793066c9dffd127bf
 # needs no device.
 ENV TORCH_EXTENSIONS_DIR=/opt/torch_extensions TORCH_XPU_ARCH_LIST=bmg
 RUN python3 - <<'PY'
-from sglang.kernels.ops.attention import xpu_sycl as x
+import sglang.kernels.ops.attention.xpu_sycl as x
 x.ink_decode_ext(); x.ink_gemv_ext(); x.ink_ggemv_ext(); x.ink_dense_ext()
 for name, kw in (("ink_attn_res", {}), ("ink_router", {}), ("ink_verify", {"fast_math": False}),
                  ("ink_verify", {"fast_math": False, "defs": ("INK_GRF256",)})):
